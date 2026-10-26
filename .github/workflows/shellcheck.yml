@@ -1,0 +1,17 @@
+name: shellcheck
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint setup.sh
+        run: shellcheck --version && shellcheck setup.sh
+      - name: Lint the embedded backup script
+        run: |
+          sed -n "/<<'BACKUP_EOF'/,/^BACKUP_EOF$/p" setup.sh | sed '1d;$d' > /tmp/ipfs_mfs_backup.sh
+          shellcheck /tmp/ipfs_mfs_backup.sh

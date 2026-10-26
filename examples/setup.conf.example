@@ -1,0 +1,43 @@
+# Example answers for a non-interactive run:
+#
+#   sudo NAS_PASSWORD='...' bash setup.sh --config setup.conf
+#
+# Copy this file, fill in your own values and keep the copy out of git
+# (setup.conf is in .gitignore). Every value here is a placeholder.
+# The NAS password is never stored in this file; pass it in NAS_PASSWORD or
+# let the script reuse /etc/ipfs-setup/smb-credentials from an earlier run.
+
+# NAS share (SMB/CIFS)
+NAS_SHARE=//nas.example.lan/ipfs
+NAS_MOUNT=/mnt/ipfs
+NAS_USER=ipfs-backup
+NAS_DOMAIN=
+# 3.1.1 (default), 3.0, 2.1, 2.0 or 1.0 (insecure; only for NAS devices without anything newer)
+SMB_VERS=3.1.1
+
+# Kubo container
+KUBO_TAG=latest
+# unless-stopped (default), always, on-failure or no
+RESTART_POLICY=unless-stopped
+
+# API access (CORS). Comma-separated.
+CORS_ORIGINS=http://ipfs-node.local:5001,http://localhost:5001,http://127.0.0.1:5001
+CORS_METHODS=PUT,POST,GET
+CID_VERSION=1
+
+# Router dynamic DNS name announced to peers outside your network (blank to skip)
+ANNOUNCE_HOST=myhome.ddns.example
+
+# LAN allowed to reach the API (5001) and gateway (8080)
+LAN_CIDR=192.168.1.0/24
+
+# Backup
+BACKUP_SUBDIR=backup
+BACKUP_SCHEDULE='*-*-* 02:00:00'
+MIRROR_DELETES=false
+BACKUP_NODE_CONFIG=false
+
+# Import of an existing backup folder
+IMPORT_HIDDEN=false
+# skip (default), replace or rename
+IMPORT_CONFLICT=skip
