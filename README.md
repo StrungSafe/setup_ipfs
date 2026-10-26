@@ -22,32 +22,49 @@ curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh
 
 1. **Docker**: installs Docker Engine and the compose plugin from Docker's
    official apt repository (skipped if already installed).
-2. **NAS mount**: mounts an SMB/CIFS share through `/etc/fstab` with systemd
+2. **NAS check**: right after the NAS questions, it checks that the NAS
+   answers on the SMB ports, then logs in with a test mount and writes a test
+   file. If something is wrong it says what (unknown host, wrong password,
+   missing share, read-only access, unsupported SMB version) and asks again
+   for just that part. If the NAS rejects the SMB version, it finds one that
+   works and offers it. It never switches to SMB 1.0 without asking. This
+   installs `cifs-utils`, the only change made before you confirm the
+   summary.
+3. **NAS mount**: mounts an SMB/CIFS share through `/etc/fstab` with systemd
    automount, so it survives reboots and NAS outages. The SMB version
    defaults to 3.1.1. SMB 1.0 is available for older NAS devices, with a
    warning that it is insecure. The password is kept in
    `/etc/ipfs-setup/smb-credentials` (mode 600), never in fstab.
-3. **IPFS node**: runs `ipfs/kubo` with Docker Compose in `/opt/ipfs`, using
+4. **IPFS node**: runs `ipfs/kubo` with Docker Compose in `/opt/ipfs`, using
    host networking. The repo stays on local disk in `/opt/ipfs/data`.
-4. **Kubo settings**, re-applied every time the container starts:
+5. **Kubo settings**, re-applied every time the container starts:
    - API allowed origins and methods (CORS)
    - `Import.CidVersion` (default 1)
    - your router's dynamic DNS name added to `Addresses.AppendAnnounce`, so
      peers outside your home network can find you, plus UPnP, relays and
      hole punching
-5. **Firewall** (ufw, or firewalld if it is already active):
+6. **Firewall** (ufw, or firewalld if it is already active):
    - SSH is allowed first, so you can't get locked out
    - `4001/tcp` and `4001/udp` (swarm) are open to everyone
    - `5001` (API), `8080` (gateway) and `5353/udp` (mDNS) are open to your
      LAN subnet only
-6. **Import of an existing backup** (optional): if the backup folder on the
+7. **Import of an existing backup** (optional): if the backup folder on the
    NAS already has files, each top-level item is added to IPFS, pinned, and
    placed in MFS at `/<name>`, with the same structure and names as the
    backup. Hidden files are skipped unless you choose to include them.
-7. **Scheduled backup**: a systemd timer (`ipfs-mfs-backup.timer`, default
-   daily at 02:00) copies MFS to the NAS backup folder with rsync. The backup
-   refuses to run if the NAS isn't mounted. Its log is
-   `/var/log/ipfs_mfs_backup.log`, rotated weekly.
+8. **Scheduled backup**: a systemd timer (`ipfs-mfs-backup.timer`) copies
+   MFS to the NAS backup folder with rsync. The backup refuses to run if the
+   NAS isn't mounted. Its log is `/var/log/ipfs_mfs_backup.log`, rotated
+   weekly. You pick the schedule from a menu, and it shows the next three
+   run times before you confirm:
+
+   | Choice | Then asks | Example |
+   | --- | --- | --- |
+   | Daily (default) | time | `02:00` or `2am` |
+   | Every few hours | 1, 2, 3, 4, 6, 8 or 12 hours | `6` runs at 00:00, 06:00, 12:00, 18:00 |
+   | Weekly | day(s) and time | `mon,thu` or `weekdays`, then `9:30pm` |
+   | Monthly | day 1-28 and time | `1`, then `02:00` |
+   | Custom | a systemd `OnCalendar` expression | `Sat *-*-* 03:15:00` |
 
 ## What it asks
 
@@ -62,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh
 | CID version | `1` |
 | Router DNS name to announce | none (you can use your current public IP instead) |
 | LAN subnet for API/gateway | detected |
-| Backup folder, schedule, mirror deletions | `backup`, `*-*-* 02:00:00`, no |
+| Backup folder, schedule, mirror deletions | `backup`, daily at 02:00, no |
 | Back up the node config and keys | no |
 | Include hidden files when importing | no |
 | If an imported item already exists in MFS | skip |

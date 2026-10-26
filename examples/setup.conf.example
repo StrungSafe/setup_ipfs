@@ -33,6 +33,18 @@ LAN_CIDR=192.168.1.0/24
 
 # Backup
 BACKUP_SUBDIR=backup
+# How often: daily (default), hourly, weekly, monthly or custom
+BACKUP_FREQUENCY=daily
+# Time for daily/weekly/monthly: 02:00, 21:30, 2am, 9:30pm ...
+BACKUP_TIME=02:00
+# hourly: run every 1, 2, 3, 4, 6, 8 or 12 hours
+BACKUP_EVERY_HOURS=6
+# weekly: day names, e.g. Sun, Mon,Thu, weekdays or weekends
+BACKUP_DAYS=Sun
+# monthly: day of the month, 1-28
+BACKUP_MONTHDAY=1
+# custom: a systemd OnCalendar expression (see 'man systemd.time').
+# For the other frequencies this is generated from the settings above.
 BACKUP_SCHEDULE='*-*-* 02:00:00'
 MIRROR_DELETES=false
 BACKUP_NODE_CONFIG=false

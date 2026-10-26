@@ -54,9 +54,20 @@ CONF_VARS=(
     KUBO_TAG RESTART_POLICY
     CORS_ORIGINS CORS_METHODS CID_VERSION ANNOUNCE_HOST
     LAN_CIDR
-    BACKUP_SUBDIR BACKUP_SCHEDULE MIRROR_DELETES BACKUP_NODE_CONFIG
+    BACKUP_SUBDIR MIRROR_DELETES BACKUP_NODE_CONFIG
+    BACKUP_FREQUENCY BACKUP_TIME BACKUP_EVERY_HOURS BACKUP_DAYS BACKUP_MONTHDAY
+    BACKUP_SCHEDULE
     IMPORT_HIDDEN IMPORT_CONFLICT
 )
+
+# Results of nas_login_check.
+NAS_E_LOGIN=10
+NAS_E_SHARE=11
+NAS_E_HOST=12
+NAS_E_PROTO=13
+NAS_E_READONLY=14
+NAS_E_OTHER=15
+NAS_E_CANT_TEST=16
 
 # ---------------------------------------------------------------- runtime --
 DRY_RUN=false
@@ -69,6 +80,8 @@ LAN_IF=""
 LAN_IP=""
 DETECTED_CIDR=""
 NAS_PASS=""
+NAS_MOUNT_ERR=""
+TMP_PATHS=()
 IMPORT_SUMMARY="not run"
 
 # ---------------------------------------------------------------- output --
@@ -101,6 +114,19 @@ run() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Removes temporary files (e.g. the test-mount credentials) on exit.
+cleanup_tmp() {
+    local p
+    for p in "${TMP_PATHS[@]}"; do
+        if [[ -d "$p" ]]; then
+            umount "$p" 2>/dev/null || true
+            rmdir "$p" 2>/dev/null || true
+        else
+            rm -f "$p"
+        fi
+    done
+}
 
 # Writes stdin to a file if the content differs. Sets FILE_CHANGED.
 #   write_file <path> <mode> [secret]   ("secret" hides the content in --dry-run)
@@ -208,6 +234,41 @@ ask_choice() {
     done
 }
 
+# ask_menu <var> <prompt> <default key> <key:label>...
+# Shows a numbered list; the answer can be the number or the key.
+ask_menu() {
+    local __var=$1 __prompt=$2 __defkey=$3 __ans __i=0 __item __def=1
+    shift 3
+    for __item in "$@"; do
+        __i=$((__i + 1))
+        [[ "${__item%%:*}" == "$__defkey" ]] && __def=$__i
+    done
+    while true; do
+        if $INTERACTIVE; then
+            printf '%s\n' "$__prompt" >&2
+            __i=0
+            for __item in "$@"; do
+                __i=$((__i + 1))
+                printf '  %d) %s\n' "$__i" "${__item#*:}" >&2
+            done
+        fi
+        ask __ans "Choose 1-$#" "$__def"
+        if [[ "$__ans" =~ ^[0-9]+$ ]] && ((__ans >= 1 && __ans <= $#)); then
+            __item="${!__ans}"
+            printf -v "$__var" '%s' "${__item%%:*}"
+            return 0
+        fi
+        for __item in "$@"; do
+            if [[ "${__item%%:*}" == "${__ans,,}" ]]; then
+                printf -v "$__var" '%s' "${__item%%:*}"
+                return 0
+            fi
+        done
+        $INTERACTIVE || die "invalid value for $__var: '$__ans'"
+        warn "choose a number from 1 to $#"
+    done
+}
+
 ask_secret() {
     local __var=$1 __prompt=$2 __val
     $INTERACTIVE || die "$__prompt is required; set NAS_PASSWORD in the environment"
@@ -223,6 +284,14 @@ ask_secret() {
 
 # ------------------------------------------------------------- validators --
 v_not_empty() { [[ -n "$1" ]] || { warn "value cannot be empty"; return 1; }; }
+
+# mount.cifs rejects commas in the user name with "invalid argument", which
+# would look like an SMB version problem, so catch it here.
+v_nas_user() {
+    [[ -n "$1" && "$1" != *,* && "$1" == "$(trim "$1")" ]] && return 0
+    warn "enter a user name without commas or leading/trailing spaces"
+    return 1
+}
 
 v_share() {
     local s
@@ -291,6 +360,24 @@ v_cidr() {
     return 1
 }
 
+v_time() {
+    parse_time "$1" >/dev/null && return 0
+    warn "expected a time like 02:00, 21:30, 2am or 9:30pm"
+    return 1
+}
+
+v_days() {
+    parse_days "$1" >/dev/null && return 0
+    warn "expected day names like sun, or mon,thu, or weekdays / weekends"
+    return 1
+}
+
+v_monthday() {
+    [[ "$1" =~ ^[0-9]{1,2}$ ]] && ((10#$1 >= 1 && 10#$1 <= 28)) && return 0
+    warn "expected a day from 1 to 28 (later days are skipped in short months)"
+    return 1
+}
+
 v_calendar() {
     if have systemd-analyze && ! systemd-analyze calendar "$1" >/dev/null 2>&1; then
         warn "not a valid systemd OnCalendar expression (e.g. '*-*-* 02:00:00' or 'daily')"
@@ -308,7 +395,7 @@ trim() {
 }
 
 to_slashes() { # \\nas\share -> //nas/share
-    local bs='\'
+    local bs=$'\\'
     printf '%s' "${1//"$bs"//}"
 }
 
@@ -463,23 +550,11 @@ collect_answers() {
 
     section "NAS share"
     echo "The NAS holds the scheduled MFS backup (and any backup to import)." >&2
-    ask NAS_SHARE "SMB share (e.g. //nas.example.lan/ipfs)" "${NAS_SHARE:-}" v_share
-    NAS_SHARE="$(to_slashes "$NAS_SHARE")"
+    ask_nas_share
     ask NAS_MOUNT "Mount point on this machine" "${NAS_MOUNT:-/mnt/ipfs}" v_abs_path
-    ask NAS_USER "NAS user name" "${NAS_USER:-}" v_not_empty
-    ask NAS_DOMAIN "NAS domain/workgroup (blank for none)" "${NAS_DOMAIN:-}" v_optional_word
-    ask_choice SMB_VERS "SMB protocol version" "${SMB_VERS:-3.1.1}" 3.1.1 3.0 2.1 2.0 1.0
-    [[ "$SMB_VERS" == "1.0" ]] && smb1_warning
-
-    if [[ -z "$NAS_PASS" ]]; then
-        local keep=false
-        if [[ -r "$CRED_FILE" ]]; then
-            ask_yn keep "Keep the saved NAS password?" true
-        fi
-        if ! $keep; then
-            ask_secret NAS_PASS "NAS password for $NAS_USER"
-        fi
-    fi
+    ask_nas_login
+    ask_smb_version
+    validate_nas_login
 
     section "IPFS node"
     if [[ -z "${KUBO_TAG:-}" ]]; then
@@ -519,7 +594,7 @@ collect_answers() {
 
     section "Backup"
     ask BACKUP_SUBDIR "Backup folder inside the NAS share" "${BACKUP_SUBDIR:-backup}" v_subdir
-    ask BACKUP_SCHEDULE "Backup schedule (systemd OnCalendar)" "${BACKUP_SCHEDULE:-*-*-* 02:00:00}" v_calendar
+    ask_schedule
     ask_yn MIRROR_DELETES "Delete files from the backup when they are deleted from MFS?" "${MIRROR_DELETES:-false}"
     echo "The node's config holds its private identity key. Backing it up lets you" \
          "restore the same peer ID, but puts the key on the NAS." >&2
@@ -540,6 +615,353 @@ smb1_warning() {
     warn "Use it only if your NAS supports nothing newer, and only on a trusted network."
 }
 
+# ------------------------------------------------------- NAS questions/check --
+nas_host() { local h="${NAS_SHARE#//}"; printf '%s' "${h%%/*}"; }
+share_name() { local s="${NAS_SHARE#//}"; s="${s#*/}"; printf '%s' "${s%%/*}"; }
+
+# shellcheck disable=SC2016  # $1/$2 expand in the inner bash, on purpose
+port_open() { timeout 5 bash -c ': </dev/tcp/"$1"/"$2"' _ "$1" "$2" 2>/dev/null; }
+
+# In --config mode a NAS problem cannot be fixed by asking again, so stop.
+nas_retry_or_die() {
+    $INTERACTIVE || die "$1"
+}
+
+# Asks for the share until its host resolves and answers on an SMB port.
+ask_nas_share() {
+    local host
+    while true; do
+        ask NAS_SHARE "SMB share (e.g. //nas.example.lan/ipfs)" "${NAS_SHARE:-}" v_share
+        NAS_SHARE="$(to_slashes "$NAS_SHARE")"
+        host="$(nas_host)"
+
+        if [[ ! "$host" =~ ^[0-9.]+$ ]] && ! getent hosts "$host" >/dev/null 2>&1; then
+            err "Can't find a NAS named '$host'."
+            info "Use its IP address or full DNS name. Windows-style names (like NAS01) only work if your"
+            info "router's DNS knows them, and '.local' names need avahi on this machine."
+        elif port_open "$host" 445; then
+            ok "'$host' answers on the SMB port (445)"
+            return 0
+        elif port_open "$host" 139; then
+            ok "'$host' answers on the NetBIOS port (139) only; it probably needs SMB 1.0"
+            return 0
+        else
+            err "'$host' doesn't answer on the SMB ports (445 or 139)."
+            info "Check that the NAS is on and that SMB file sharing is enabled."
+        fi
+        nas_retry_or_die "fix NAS_SHARE in the config file"
+        info "Fix the share, or press Enter to try the same one again."
+    done
+}
+
+# Asks for user, domain and password. "force" asks for the password even if
+# one is saved (after the NAS rejected it).
+ask_nas_login() {
+    local force=${1-} keep=false
+    ask NAS_USER "NAS user name" "${NAS_USER:-}" v_nas_user
+    ask NAS_DOMAIN "NAS domain/workgroup (blank for none)" "${NAS_DOMAIN:-}" v_optional_word
+    if [[ -n "$force" ]]; then
+        NAS_PASS=""
+    elif [[ -n "$NAS_PASS" ]]; then
+        return 0
+    elif [[ -r "$CRED_FILE" ]]; then
+        ask_yn keep "Keep the saved NAS password?" true
+        if $keep; then
+            NAS_PASS="$(sed -n 's/^password=//p' "$CRED_FILE")"
+            [[ -n "$NAS_PASS" ]] && return 0
+        fi
+    fi
+    ask_secret NAS_PASS "NAS password for $NAS_USER"
+}
+
+ask_smb_version() {
+    ask_choice SMB_VERS "SMB protocol version" "${SMB_VERS:-3.1.1}" 3.1.1 3.0 2.1 2.0 1.0
+    if [[ "$SMB_VERS" == "1.0" ]]; then
+        smb1_warning
+        smb1_kernel_check
+    fi
+}
+
+# The login check needs root and mount.cifs. cifs-utils is the only package
+# installed before the summary is confirmed.
+nas_can_test() {
+    if [[ $EUID -ne 0 ]]; then
+        info "skipping the NAS login check (needs root)"
+        return 1
+    fi
+    have mount.cifs && return 0
+    if $DRY_RUN; then
+        info "skipping the NAS login check: cifs-utils isn't installed, and a dry run installs nothing"
+        return 1
+    fi
+    info "installing cifs-utils to check the NAS login (the only change made before you confirm)"
+    { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cifs-utils; } >/dev/null \
+        || die "could not install cifs-utils"
+}
+
+classify_mount_error() {
+    case "$1" in
+        *"error(13)"*) echo "$NAS_E_LOGIN" ;;
+        *"error(2)"*|*"error(6)"*) echo "$NAS_E_SHARE" ;;
+        # The port check already passed, so "host is down" means the NAS
+        # refused the protocol version (typical for SMB1-only devices).
+        *"error(112)"*|*"error(95)"*|*"error(22)"*|*"error(121)"*) echo "$NAS_E_PROTO" ;;
+        *"could not resolve"*|*"error(110)"*|*"error(111)"*|*"error(113)"*|*"error(115)"*) echo "$NAS_E_HOST" ;;
+        *"error(1)"*|*"only root"*) echo "$NAS_E_CANT_TEST" ;;
+        *) echo "$NAS_E_OTHER" ;;
+    esac
+}
+
+nas_error_message() {
+    case "$1" in
+        "$NAS_E_LOGIN") echo "The NAS rejected the user name or password for '$NAS_USER'." ;;
+        "$NAS_E_SHARE") echo "The NAS has no share named '$(share_name)', or '$NAS_USER' isn't allowed to see it." ;;
+        "$NAS_E_HOST") echo "Can't reach the NAS at '$(nas_host)'." ;;
+        "$NAS_E_PROTO") echo "The NAS doesn't accept SMB $2." ;;
+        "$NAS_E_READONLY") echo "Logged in, but '$NAS_USER' can't write to the share." ;;
+        *) echo "Mounting the share failed: ${NAS_MOUNT_ERR:-unknown error}" ;;
+    esac
+}
+
+# Test-mounts the share in a temporary folder with the current answers,
+# writes and deletes a file, and unmounts. Returns 0 or a NAS_E_* code.
+#   nas_login_check <smb version>
+nas_login_check() {
+    local vers=$1 cred tmp out rc=0
+    NAS_MOUNT_ERR=""
+    cred="$(mktemp)"
+    tmp="$(mktemp -d /tmp/ipfs-setup-mount.XXXXXX)"
+    TMP_PATHS+=("$cred" "$tmp")
+    chmod 600 "$cred"
+    credentials "$NAS_PASS" >"$cred"
+
+    if out="$(mount -t cifs "$NAS_SHARE" "$tmp" -o "$(cifs_opts "$cred" "$vers")" 2>&1)"; then
+        if ! { touch "$tmp/.ipfs-setup-write-test" && rm -f "$tmp/.ipfs-setup-write-test"; } 2>/dev/null; then
+            rc=$NAS_E_READONLY
+        fi
+        umount "$tmp" 2>/dev/null || umount -l "$tmp" 2>/dev/null || true
+    else
+        NAS_MOUNT_ERR="$out"
+        rc="$(classify_mount_error "$out")"
+    fi
+    rm -f "$cred"
+    rmdir "$tmp" 2>/dev/null || true
+    return "$rc"
+}
+
+# Finds the newest SMB 2.0+ version the NAS accepts, other than the one tried.
+find_smb_version() {
+    local v rc
+    for v in 3.1.1 3.0 2.1 2.0; do
+        [[ "$v" == "$SMB_VERS" ]] && continue
+        rc=0
+        nas_login_check "$v" || rc=$?
+        if ((rc != NAS_E_PROTO)); then
+            printf '%s' "$v"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Logs in to the NAS with the answers so far and asks again for just the part
+# that is wrong.
+validate_nas_login() {
+    nas_can_test || return 0
+    info "checking the login to $NAS_SHARE (SMB $SMB_VERS)"
+    local rc alt use
+    while true; do
+        rc=0
+        nas_login_check "$SMB_VERS" || rc=$?
+        case "$rc" in
+            0)
+                ok "logged in to $NAS_SHARE as $NAS_USER with SMB $SMB_VERS; the share is writable"
+                return 0 ;;
+            "$NAS_E_CANT_TEST")
+                warn "this system doesn't allow a test mount here; skipping the NAS login check"
+                return 0 ;;
+            "$NAS_E_LOGIN"|"$NAS_E_READONLY")
+                err "$(nas_error_message "$rc")"
+                nas_retry_or_die "check NAS_USER, NAS_DOMAIN and NAS_PASSWORD"
+                ask_nas_login force ;;
+            "$NAS_E_SHARE"|"$NAS_E_HOST")
+                err "$(nas_error_message "$rc")"
+                nas_retry_or_die "check NAS_SHARE in the config file"
+                ask_nas_share ;;
+            "$NAS_E_PROTO")
+                err "$(nas_error_message "$rc" "$SMB_VERS")"
+                if alt="$(find_smb_version)"; then
+                    nas_retry_or_die "SMB $alt works with this NAS; set SMB_VERS=$alt in the config file"
+                    ask_yn use "SMB $alt works with this NAS. Use it?" true
+                    if $use; then SMB_VERS=$alt; else ask_smb_version; fi
+                elif [[ "$SMB_VERS" != "1.0" ]]; then
+                    warn "None of SMB 2.0 - 3.1.1 worked; this NAS may only speak SMB 1.0."
+                    smb1_warning
+                    nas_retry_or_die "set SMB_VERS=1.0 in the config file if you accept the risk"
+                    ask_yn use "Try SMB 1.0?" false
+                    $use || die "stopped: the NAS doesn't accept SMB 2.0 or newer"
+                    SMB_VERS=1.0
+                    smb1_kernel_check
+                else
+                    die "SMB 1.0 failed too; this kernel may not support it (see the warning above)"
+                fi ;;
+            *)
+                err "$(nas_error_message "$rc")"
+                nas_retry_or_die "check the NAS settings in the config file"
+                ask_yn use "Enter the NAS details again?" true
+                $use || die "stopped at the NAS check"
+                ask_nas_share
+                ask_nas_login force
+                ask_smb_version ;;
+        esac
+        info "checking again"
+    done
+}
+
+# ---------------------------------------------------------- backup schedule --
+# "2am", "2:30 PM", "14:05", "noon", "midnight" -> HH:MM
+parse_time() {
+    local t="${1,,}" h m
+    t="${t// /}"
+    case "$t" in
+        noon) t="12:00" ;;
+        midnight) t="00:00" ;;
+    esac
+    if [[ "$t" =~ ^([0-9]{1,2})(:([0-9]{2}))?(am|pm)$ ]]; then
+        h=$((10#${BASH_REMATCH[1]}))
+        m=$((10#${BASH_REMATCH[3]:-0}))
+        ((h >= 1 && h <= 12)) || return 1
+        h=$((h % 12))
+        [[ "${BASH_REMATCH[4]}" == "pm" ]] && h=$((h + 12))
+    elif [[ "$t" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+        h=$((10#${BASH_REMATCH[1]}))
+        m=$((10#${BASH_REMATCH[2]}))
+        ((h <= 23)) || return 1
+    else
+        return 1
+    fi
+    ((m <= 59)) || return 1
+    printf '%02d:%02d' "$h" "$m"
+}
+
+# "mon, Thursday" / "weekdays" / "weekends" -> "Mon,Thu" (in week order)
+parse_days() {
+    local input="${1,,}" word d out="" picked=" " words
+    read -ra words <<<"${input//,/ }"
+    for word in "${words[@]}"; do
+        case "$word" in
+            weekdays) picked+="Mon Tue Wed Thu Fri " ;;
+            weekends|weekend) picked+="Sat Sun " ;;
+            mon|monday) picked+="Mon " ;;
+            tue|tues|tuesday) picked+="Tue " ;;
+            wed|wednesday) picked+="Wed " ;;
+            thu|thur|thurs|thursday) picked+="Thu " ;;
+            fri|friday) picked+="Fri " ;;
+            sat|saturday) picked+="Sat " ;;
+            sun|sunday) picked+="Sun " ;;
+            *) return 1 ;;
+        esac
+    done
+    for d in Mon Tue Wed Thu Fri Sat Sun; do
+        [[ "$picked" == *" $d "* ]] && out+="${out:+,}$d"
+    done
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out"
+}
+
+build_schedule() {
+    case "$BACKUP_FREQUENCY" in
+        daily)   printf '*-*-* %s:00' "$BACKUP_TIME" ;;
+        hourly)  printf '*-*-* 00/%s:00:00' "$BACKUP_EVERY_HOURS" ;;
+        weekly)  printf '%s *-*-* %s:00' "$BACKUP_DAYS" "$BACKUP_TIME" ;;
+        monthly) printf '*-*-%02d %s:00' "$((10#$BACKUP_MONTHDAY))" "$BACKUP_TIME" ;;
+        custom)  printf '%s' "$BACKUP_SCHEDULE" ;;
+    esac
+}
+
+describe_schedule() {
+    case "$BACKUP_FREQUENCY" in
+        daily)   printf 'daily at %s' "$BACKUP_TIME" ;;
+        hourly)
+            if [[ "$BACKUP_EVERY_HOURS" == 1 ]]; then
+                printf 'every hour'
+            else
+                local h out=""
+                for ((h = 0; h < 24; h += BACKUP_EVERY_HOURS)); do
+                    out+="${out:+, }$(printf '%02d:00' "$h")"
+                done
+                printf 'every %s hours (%s)' "$BACKUP_EVERY_HOURS" "$out"
+            fi ;;
+        weekly)  printf 'weekly on %s at %s' "${BACKUP_DAYS//,/, }" "$BACKUP_TIME" ;;
+        monthly) printf 'monthly on day %s at %s' "$((10#$BACKUP_MONTHDAY))" "$BACKUP_TIME" ;;
+        *)       printf "on the schedule '%s'" "$BACKUP_SCHEDULE" ;;
+    esac
+}
+
+show_next_runs() {
+    have systemd-analyze || return 0
+    local runs
+    runs="$(systemd-analyze calendar --iterations=3 "$BACKUP_SCHEDULE" 2>/dev/null \
+        | sed -n 's/^ *\(Next elapse\|Iter\. #[0-9]*\): *//p')" || return 0
+    [[ -n "$runs" ]] || return 0
+    echo "  Next runs (each may start up to 5 minutes later):" >&2
+    printf '    %s\n' "${runs//$'\n'/$'\n'    }" >&2
+}
+
+ask_backup_time() {
+    ask BACKUP_TIME "At what time? (e.g. 02:00 or 2am)" "${BACKUP_TIME:-02:00}" v_time
+    BACKUP_TIME="$(parse_time "$BACKUP_TIME")"
+}
+
+ask_schedule() {
+    # A config from before the menu existed only has BACKUP_SCHEDULE.
+    if [[ -z "${BACKUP_FREQUENCY:-}" && -n "${BACKUP_SCHEDULE:-}" ]]; then
+        if [[ "$BACKUP_SCHEDULE" =~ ^\*-\*-\*\ ([0-9]{2}:[0-9]{2}):00$ ]]; then
+            BACKUP_FREQUENCY=daily
+            BACKUP_TIME="${BASH_REMATCH[1]}"
+        else
+            BACKUP_FREQUENCY=custom
+        fi
+    fi
+
+    local use
+    while true; do
+        ask_menu BACKUP_FREQUENCY "How often should the backup run?" "${BACKUP_FREQUENCY:-daily}" \
+            "daily:Daily" \
+            "hourly:Every few hours" \
+            "weekly:Weekly" \
+            "monthly:Monthly" \
+            "custom:Custom (systemd OnCalendar, for advanced users)"
+        case "$BACKUP_FREQUENCY" in
+            daily)
+                ask_backup_time ;;
+            hourly)
+                ask_choice BACKUP_EVERY_HOURS "Run every how many hours" "${BACKUP_EVERY_HOURS:-6}" 1 2 3 4 6 8 12 ;;
+            weekly)
+                ask BACKUP_DAYS "On which day(s)? (e.g. sun, mon,thu or weekdays)" "${BACKUP_DAYS:-Sun}" v_days
+                BACKUP_DAYS="$(parse_days "$BACKUP_DAYS")"
+                ask_backup_time ;;
+            monthly)
+                ask BACKUP_MONTHDAY "On which day of the month? (1-28)" "${BACKUP_MONTHDAY:-1}" v_monthday
+                BACKUP_MONTHDAY="$((10#$BACKUP_MONTHDAY))"
+                ask_backup_time ;;
+            custom)
+                echo "See 'man systemd.time' (CALENDAR EVENTS) for the syntax." >&2
+                ask BACKUP_SCHEDULE "OnCalendar expression" "${BACKUP_SCHEDULE:-*-*-* 02:00:00}" v_calendar ;;
+        esac
+        BACKUP_SCHEDULE="$(build_schedule)"
+
+        info "backup will run $(describe_schedule)"
+        show_next_runs
+        if [[ "$BACKUP_FREQUENCY" == hourly ]] && ((BACKUP_EVERY_HOURS < 6)); then
+            warn "each backup exports and checksums all of MFS, which is slow for large collections"
+        fi
+        $INTERACTIVE || return 0
+        ask_yn use "Use this schedule?" true
+        $use && return 0
+    done
+}
+
 show_summary() {
     section "Summary"
     local announce="(none)"
@@ -553,7 +975,7 @@ show_summary() {
   CID version .......... $CID_VERSION
   Announced addresses .. $announce
   Firewall ............. $SWARM_PORT/tcp+udp from anywhere; $API_PORT, $GATEWAY_PORT from $LAN_CIDR
-  Backup ............... $NAS_MOUNT/$BACKUP_SUBDIR, schedule '$BACKUP_SCHEDULE', mirror deletes: $MIRROR_DELETES
+  Backup ............... $NAS_MOUNT/$BACKUP_SUBDIR, $(describe_schedule), mirror deletes: $MIRROR_DELETES
   Node config backup ... $BACKUP_NODE_CONFIG
   Import ............... hidden files: $IMPORT_HIDDEN, on conflict: $IMPORT_CONFLICT
 EOF
@@ -642,9 +1064,10 @@ smb1_kernel_check() {
     fi
 }
 
+#   cifs_opts [credentials file] [smb version]
 cifs_opts() {
     printf 'credentials=%s,vers=%s,uid=0,gid=0,file_mode=0664,dir_mode=0775,iocharset=utf8' \
-        "$CRED_FILE" "$SMB_VERS"
+        "${1:-$CRED_FILE}" "${2:-$SMB_VERS}"
 }
 
 nas_mounted() {
@@ -652,23 +1075,6 @@ nas_mounted() {
     # as a mount, so check for a real CIFS mount specifically.
     ls "$NAS_MOUNT" >/dev/null 2>&1 || true
     findmnt -rn -t cifs,smb3 -M "$NAS_MOUNT" >/dev/null 2>&1
-}
-
-test_mount() {
-    local tmp rc=0
-    tmp="$(mktemp -d /tmp/ipfs-setup-mount.XXXXXX)"
-    if mount -t cifs "$NAS_SHARE" "$tmp" -o "$(cifs_opts)"; then
-        if ! { touch "$tmp/.ipfs-setup-write-test" && rm -f "$tmp/.ipfs-setup-write-test"; }; then
-            err "the share mounted but is not writable by $NAS_USER"
-            rc=1
-        fi
-        umount "$tmp" || true
-    else
-        rc=1
-        dmesg 2>/dev/null | grep -i cifs | tail -n 5 | sed 's/^/    /' >&2 || true
-    fi
-    rmdir "$tmp" 2>/dev/null || true
-    return "$rc"
 }
 
 credentials() {
@@ -680,32 +1086,26 @@ credentials() {
 
 configure_nas() {
     section "NAS mount"
-    [[ "$SMB_VERS" == "1.0" ]] && smb1_kernel_check
 
     if [[ -n "$NAS_PASS" ]]; then
         credentials "$NAS_PASS" | write_file "$CRED_FILE" 0600 secret
         $DRY_RUN || ok "credentials saved to $CRED_FILE (mode 600)"
-    elif [[ -r "$CRED_FILE" ]]; then
-        # Keep the saved password, but update user/domain in case they changed.
-        credentials "$(sed -n 's/^password=//p' "$CRED_FILE")" | write_file "$CRED_FILE" 0600 secret
     elif ! $DRY_RUN; then
         die "no NAS password given (set NAS_PASSWORD or run interactively)"
     fi
 
     run mkdir -p "$NAS_MOUNT"
 
+    # The login was checked while asking the questions; this is a last check
+    # with the final settings before they go into /etc/fstab.
     if $DRY_RUN; then
         info "would test-mount $NAS_SHARE with SMB $SMB_VERS"
     else
-        while ! test_mount; do
-            err "could not mount $NAS_SHARE with SMB $SMB_VERS"
-            $INTERACTIVE || die "check the share, credentials and SMB version"
-            local retry
-            ask_yn retry "Try again with a different SMB version?" true
-            $retry || die "aborted at the NAS mount step"
-            ask_choice SMB_VERS "SMB protocol version" "$SMB_VERS" 3.1.1 3.0 2.1 2.0 1.0
-            [[ "$SMB_VERS" == "1.0" ]] && { smb1_warning; smb1_kernel_check; }
-        done
+        local rc=0
+        nas_login_check "$SMB_VERS" || rc=$?
+        if ((rc != 0 && rc != NAS_E_CANT_TEST)); then
+            die "$(nas_error_message "$rc" "$SMB_VERS")"
+        fi
         ok "test mount of $NAS_SHARE succeeded and is writable"
     fi
 
@@ -1100,7 +1500,7 @@ EOF
 
     run systemctl daemon-reload
     run systemctl enable --now ipfs-mfs-backup.timer
-    ok "backup scheduled ('$BACKUP_SCHEDULE'); log: /var/log/ipfs_mfs_backup.log"
+    ok "backup scheduled $(describe_schedule); log: /var/log/ipfs_mfs_backup.log"
 }
 
 write_backup_script() {
@@ -1283,6 +1683,7 @@ EOF
 main() {
     parse_args "$@"
     trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+    trap cleanup_tmp EXIT
     printf '%sIPFS node setup %s%s\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET" >&2
 
     preflight
@@ -1309,7 +1710,6 @@ main() {
     install_packages
     install_docker
     configure_nas
-    save_conf   # the SMB version may have changed during the test mount
     deploy_node
     configure_firewall
     pause_backup_timer
