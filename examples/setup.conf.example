@@ -24,6 +24,10 @@ RESTART_POLICY=unless-stopped
 CORS_ORIGINS=http://ipfs-node.local:5001,http://localhost:5001,http://127.0.0.1:5001
 CORS_METHODS=PUT,POST,GET
 CID_VERSION=1
+# Chunk size for content added without its own (files up to it stay one
+# block). Blank = Kubo's default (256 KiB). A size like 1MiB or 512KiB, or a
+# Kubo chunker string (size-1048576, rabin-..., buzhash). Max 2,096,896 bytes.
+IMPORT_CHUNKER=
 
 # Router dynamic DNS name announced to peers outside your network (blank to skip)
 ANNOUNCE_HOST=myhome.ddns.example

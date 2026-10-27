@@ -45,6 +45,7 @@ CONTAINER_NAME="ipfs"
 SWARM_PORT=4001
 API_PORT=5001
 GATEWAY_PORT=8080
+CHUNK_MAX=2096896   # largest chunk size Kubo accepts (v0.43)
 FSTAB_BEGIN="# >>> ipfs-setup (managed by setup.sh; edits between these lines are overwritten) >>>"
 FSTAB_END="# <<< ipfs-setup <<<"
 
@@ -52,7 +53,7 @@ FSTAB_END="# <<< ipfs-setup <<<"
 CONF_VARS=(
     NAS_SHARE NAS_MOUNT NAS_USER NAS_DOMAIN SMB_VERS
     KUBO_TAG RESTART_POLICY
-    CORS_ORIGINS CORS_METHODS CID_VERSION ANNOUNCE_HOST
+    CORS_ORIGINS CORS_METHODS CID_VERSION IMPORT_CHUNKER ANNOUNCE_HOST
     LAN_CIDR
     BACKUP_SUBDIR MIRROR_DELETES BACKUP_NODE_CONFIG
     BACKUP_FREQUENCY BACKUP_TIME BACKUP_EVERY_HOURS BACKUP_DAYS BACKUP_MONTHDAY
@@ -378,6 +379,13 @@ v_monthday() {
     return 1
 }
 
+v_chunker() {
+    parse_chunker "$1" >/dev/null && return 0
+    warn "expected a size like 512KiB, 1MiB or 1.5MiB (1 byte to $(group_digits "$CHUNK_MAX") bytes),"
+    warn "or a Kubo chunker such as size-1048576, rabin-262144-524288-1048576 or buzhash"
+    return 1
+}
+
 v_calendar() {
     if have systemd-analyze && ! systemd-analyze calendar "$1" >/dev/null 2>&1; then
         warn "not a valid systemd OnCalendar expression (e.g. '*-*-* 02:00:00' or 'daily')"
@@ -427,7 +435,93 @@ human_size() {
         fmt = (i == 1 ? "%d %s" : "%.1f %s"); printf fmt, b, u[i] }'
 }
 
-ipfs_exec() { docker exec "$CONTAINER_NAME" ipfs "$@"; }
+group_digits() { # 1048576 -> 1,048,576
+    local n=$1 out=""
+    while ((${#n} > 3)); do
+        out=",${n: -3}$out"
+        n="${n:0:${#n}-3}"
+    done
+    printf '%s%s' "$n" "$out"
+}
+
+# ------------------------------------------------------------- chunk size --
+# "1MiB", "1.5 MB", "512k", "786432", "size-N", "rabin-...", "buzhash"
+#   -> a Kubo chunker string. KB/MB are binary units (1 MB = 1,048,576 bytes).
+parse_chunker() {
+    local s="${1,,}" num mult bytes
+    s="${s// /}"
+    if [[ "$s" == "buzhash" || "$s" =~ ^rabin(-[0-9]{1,10}(-[0-9]{1,10}-[0-9]{1,10})?)?$ ]]; then
+        printf '%s' "$s"
+        return 0
+    fi
+    if [[ "$s" =~ ^size-([0-9]{1,10})$ ]]; then
+        bytes=$((10#${BASH_REMATCH[1]}))
+    elif [[ "$s" =~ ^([0-9]{1,10}(\.[0-9]+)?)(b|k|kb|kib|m|mb|mib)?$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        case "${BASH_REMATCH[3]}" in
+            ""|b) mult=1 ;;
+            k|kb|kib) mult=1024 ;;
+            *) mult=1048576 ;;
+        esac
+        bytes="$(awk -v n="$num" -v m="$mult" 'BEGIN { printf "%d", n * m }')"
+    else
+        return 1
+    fi
+    ((bytes >= 1 && bytes <= CHUNK_MAX)) || return 1
+    printf 'size-%s' "$bytes"
+}
+
+describe_chunker() {
+    local c="${1-$IMPORT_CHUNKER}" n
+    case "$c" in
+        "")
+            printf "256 KiB (Kubo's default)" ;;
+        size-*)
+            n="${c#size-}"
+            if ((n % 1048576 == 0)); then
+                printf '%d MiB' $((n / 1048576))
+            elif ((n < 1048576 && n % 1024 == 0)); then
+                printf '%d KiB' $((n / 1024))
+            else
+                human_size "$n"
+            fi
+            printf ' (%s bytes)' "$(group_digits "$n")" ;;
+        *)
+            printf '%s' "$c" ;;
+    esac
+}
+
+ask_chunker() {
+    local def choice custom="512KiB"
+    case "${IMPORT_CHUNKER:-}" in
+        "") def=default ;;
+        size-1048576) def=1mib ;;
+        *) def=custom; custom="$IMPORT_CHUNKER" ;;
+    esac
+    echo "Files up to the chunk size are stored as one block; bigger files are split into chunks." >&2
+    echo "It applies to content added without its own chunk size, including the backup import." >&2
+    echo "Content already on the node is not re-chunked." >&2
+    ask_menu choice "Chunk size for new files" "$def" \
+        "default:256 KiB (Kubo's default)" \
+        "1mib:1 MiB" \
+        "custom:Custom (a size like 512KiB or 1.5MiB, or a Kubo chunker string)"
+    case "$choice" in
+        default) IMPORT_CHUNKER="" ;;
+        1mib) IMPORT_CHUNKER="size-1048576" ;;
+        custom)
+            ask IMPORT_CHUNKER "Chunk size" "$custom" v_chunker
+            IMPORT_CHUNKER="$(parse_chunker "$IMPORT_CHUNKER")" ;;
+    esac
+    info "chunk size: $(describe_chunker)"
+    if [[ "$IMPORT_CHUNKER" =~ ^size-([0-9]+)$ ]] && ((BASH_REMATCH[1] > 1048576)); then
+        warn "blocks over 1 MiB can be refused by peers and gateways running older or other IPFS software"
+    fi
+}
+
+# Always go through the daemon's API. Without --api, commands like "ipfs id"
+# also succeed offline while the daemon is still starting, and can then clash
+# with it over the repo lock.
+ipfs_exec() { docker exec "$CONTAINER_NAME" ipfs "--api=/ip4/127.0.0.1/tcp/$API_PORT" "$@"; }
 
 container_running() {
     [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == "true" ]]
@@ -575,6 +669,7 @@ collect_answers() {
     ask CORS_METHODS "Allowed API methods (comma-separated)" "${CORS_METHODS:-PUT,POST,GET}" v_methods
     CORS_METHODS="$(normalize_list "${CORS_METHODS^^}")"
     ask_choice CID_VERSION "CID version for new content" "${CID_VERSION:-1}" 1 0
+    ask_chunker
 
     section "Reachability from outside your home network"
     echo "Peers outside your network find you through your router's public address." >&2
@@ -973,6 +1068,7 @@ show_summary() {
   Allowed origins ...... $CORS_ORIGINS
   Allowed methods ...... $CORS_METHODS
   CID version .......... $CID_VERSION
+  Chunk size ........... $(describe_chunker)
   Announced addresses .. $announce
   Firewall ............. $SWARM_PORT/tcp+udp from anywhere; $API_PORT, $GATEWAY_PORT from $LAN_CIDR
   Backup ............... $NAS_MOUNT/$BACKUP_SUBDIR, $(describe_schedule), mirror deletes: $MIRROR_DELETES
@@ -1196,6 +1292,13 @@ ipfs config --json API.HTTPHeaders.Access-Control-Allow-Origin '$(to_json_array 
 ipfs config --json API.HTTPHeaders.Access-Control-Allow-Methods '$(to_json_array "$CORS_METHODS")'
 
 ipfs config --json Import.CidVersion $CID_VERSION
+
+# Chunk size for content added without its own (files up to it stay one block).
+$(if [[ -n "$IMPORT_CHUNKER" ]]; then
+    echo "ipfs config Import.UnixFSChunker $IMPORT_CHUNKER"
+else
+    echo "ipfs config --json Import.UnixFSChunker null"
+fi)
 
 # Reachability from outside the home network: announce the router's public
 # name, keep UPnP port mapping on, and allow relays and hole punching.
@@ -1428,7 +1531,8 @@ import_backup() {
     else
         ok "import: $IMPORT_SUMMARY"
     fi
-    info "note: if the original node used CID v0 or other import settings, CIDs differ from the old ones"
+    info "note: files keep their original CIDs only if chunk size ($(describe_chunker)), CID version"
+    info "and raw leaves match how they were first added; otherwise they get new CIDs"
 }
 
 # ----------------------------------------------------------------- backup --

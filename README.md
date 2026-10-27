@@ -40,6 +40,11 @@ curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh
 5. **Kubo settings**, re-applied every time the container starts:
    - API allowed origins and methods (CORS)
    - `Import.CidVersion` (default 1)
+   - `Import.UnixFSChunker`, the chunk size for content added without its
+     own: Kubo's default (256 KiB), 1 MiB, or a custom size. Files up to
+     the chunk size are stored as one block. It applies to `ipfs add`, MFS
+     writes and the backup import, but not to apps that send their own chunk
+     size. Content already on the node is not re-chunked.
    - your router's dynamic DNS name added to `Addresses.AppendAnnounce`, so
      peers outside your home network can find you, plus UPnP, relays and
      hole punching
@@ -77,6 +82,7 @@ curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh
 | Allowed origins | `http://<hostname>.local:5001`, localhost and the LAN IP |
 | Allowed methods | `PUT,POST,GET` |
 | CID version | `1` |
+| Chunk size for new files | 256 KiB (Kubo's default); also 1 MiB or custom, e.g. `512KiB`, `1.5MiB` (KB/MB are binary units; max 2,096,896 bytes) |
 | Router DNS name to announce | none (you can use your current public IP instead) |
 | LAN subnet for API/gateway | detected |
 | Backup folder, schedule, mirror deletions | `backup`, daily at 02:00, no |
@@ -136,9 +142,13 @@ docker exec ipfs ipfs id                      # peer ID and addresses
 
 ## Notes
 
-- **Imported content may get new CIDs.** CIDs depend on the import settings.
-  If the old node used CID v0 or different settings, the same files get new
-  CIDs, and old links won't resolve to them.
+- **Imported files keep their CIDs only if the import settings match.** A
+  file's CID depends on the chunk size, CID version and raw-leaves setting
+  it was added with. If the backup import uses the same ones, files get
+  their original CIDs back and old links keep working. Otherwise they get
+  new CIDs. For example, with Kubo's default 256 KiB chunks, a 1 MB file is
+  split into 4 blocks and gets a different CID than an app that stored it
+  as one block.
 - **The node's private key isn't backed up by default.** Turning on "back up
   the node config and keys" copies `config` and `keystore` to
   `<mount>/node-config`. Anyone who can read the share can then impersonate
