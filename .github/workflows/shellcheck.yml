@@ -4,14 +4,19 @@ on:
   push:
   pull_request:
 
+# shellcheck is pinned so CI flags the same things as a local run of the
+# same image; the runner's own shellcheck changes with the Ubuntu image.
+env:
+  SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0
+
 jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Lint setup.sh
-        run: shellcheck --version && shellcheck setup.sh
+        run: docker run --rm -v "$PWD:/mnt" -w /mnt "$SHELLCHECK_IMAGE" setup.sh
       - name: Lint the embedded backup script
         run: |
-          sed -n "/<<'BACKUP_EOF'/,/^BACKUP_EOF$/p" setup.sh | sed '1d;$d' > /tmp/ipfs_mfs_backup.sh
-          shellcheck /tmp/ipfs_mfs_backup.sh
+          sed -n "/<<'BACKUP_EOF'/,/^BACKUP_EOF$/p" setup.sh | sed '1d;$d' > ipfs_mfs_backup.sh
+          docker run --rm -v "$PWD:/mnt" -w /mnt "$SHELLCHECK_IMAGE" ipfs_mfs_backup.sh

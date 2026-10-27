@@ -471,8 +471,9 @@ parse_chunker() {
     printf 'size-%s' "$bytes"
 }
 
+#   describe_chunker <chunker string, "" for Kubo's default>
 describe_chunker() {
-    local c="${1-$IMPORT_CHUNKER}" n
+    local c="$1" n
     case "$c" in
         "")
             printf "256 KiB (Kubo's default)" ;;
@@ -512,7 +513,7 @@ ask_chunker() {
             ask IMPORT_CHUNKER "Chunk size" "$custom" v_chunker
             IMPORT_CHUNKER="$(parse_chunker "$IMPORT_CHUNKER")" ;;
     esac
-    info "chunk size: $(describe_chunker)"
+    info "chunk size: $(describe_chunker "$IMPORT_CHUNKER")"
     if [[ "$IMPORT_CHUNKER" =~ ^size-([0-9]+)$ ]] && ((BASH_REMATCH[1] > 1048576)); then
         warn "blocks over 1 MiB can be refused by peers and gateways running older or other IPFS software"
     fi
@@ -1068,7 +1069,7 @@ show_summary() {
   Allowed origins ...... $CORS_ORIGINS
   Allowed methods ...... $CORS_METHODS
   CID version .......... $CID_VERSION
-  Chunk size ........... $(describe_chunker)
+  Chunk size ........... $(describe_chunker "$IMPORT_CHUNKER")
   Announced addresses .. $announce
   Firewall ............. $SWARM_PORT/tcp+udp from anywhere; $API_PORT, $GATEWAY_PORT from $LAN_CIDR
   Backup ............... $NAS_MOUNT/$BACKUP_SUBDIR, $(describe_schedule), mirror deletes: $MIRROR_DELETES
@@ -1088,7 +1089,9 @@ install_packages() {
     systemctl is-active --quiet firewalld 2>/dev/null || pkgs+=(ufw)
     local missing=() p
     for p in "${pkgs[@]}"; do
-        dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "install ok installed" || missing+=("$p")
+        # No "| grep -q" here or below: with pipefail, grep exiting early can
+        # make the pipeline fail even when it matched.
+        [[ "$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null)" == *"install ok installed"* ]] || missing+=("$p")
     done
     if ((${#missing[@]})); then
         info "installing: ${missing[*]}"
@@ -1386,7 +1389,7 @@ configure_firewall() {
     fi
 
     local was_active=false
-    ufw status 2>/dev/null | grep -q '^Status: active' && was_active=true
+    [[ "$(ufw status 2>/dev/null)" =~ (^|$'\n')"Status: active" ]] && was_active=true
 
     # SSH first, so enabling the firewall cannot lock you out.
     run ufw allow "$ssh/tcp" comment 'SSH'
@@ -1531,7 +1534,7 @@ import_backup() {
     else
         ok "import: $IMPORT_SUMMARY"
     fi
-    info "note: files keep their original CIDs only if chunk size ($(describe_chunker)), CID version"
+    info "note: files keep their original CIDs only if chunk size ($(describe_chunker "${IMPORT_CHUNKER:-}")), CID version"
     info "and raw leaves match how they were first added; otherwise they get new CIDs"
 }
 
