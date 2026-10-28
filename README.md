@@ -126,7 +126,7 @@ setting.
 | `/opt/ipfs/data` | IPFS repo |
 | `/opt/ipfs/import` | temporary staging for the backup import (emptied afterwards) |
 | `/etc/fstab` (marked block) | NAS mount; a timestamped backup of fstab is kept |
-| `/etc/ipfs-setup/` | saved answers, SMB credentials, backup settings |
+| `/etc/ipfs-setup/` | saved answers, SMB credentials, backup settings, and a record of whether setup installed Docker or turned on ufw |
 | `/usr/local/sbin/ipfs_mfs_backup.sh` | backup script |
 | `/etc/systemd/system/ipfs-mfs-backup.{service,timer}` | backup schedule |
 | `/etc/logrotate.d/ipfs_mfs_backup` | log rotation |
@@ -158,10 +158,36 @@ docker exec ipfs ipfs id                      # peer ID and addresses
 ## Uninstall
 
 ```bash
-sudo systemctl disable --now ipfs-mfs-backup.timer
-sudo docker compose -p ipfs -f /opt/ipfs/docker-compose.yml down
-sudo rm -f /etc/systemd/system/ipfs-mfs-backup.* /usr/local/sbin/ipfs_mfs_backup.sh /etc/logrotate.d/ipfs_mfs_backup
-# Remove the "ipfs-setup" block from /etc/fstab, then:
-sudo rm -rf /etc/ipfs-setup
-# The repo in /opt/ipfs/data is left in place; delete it yourself if you no longer need it.
+curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh | sudo bash -s -- --uninstall
 ```
+
+To see what it would remove first, add `--dry-run`. To run it without
+questions (keeping the repo and Docker), add `--yes`.
+
+It first lists what it found, asks the questions below, and shows a
+summary to confirm. If the node and its backup are still running, it
+offers to run one last backup to the NAS first.
+
+**Removed:**
+
+- the backup timer, service, script, settings, logrotate config and log
+- the Kubo container and image, the compose file, init script and import folder
+- the NAS mount. Its block in `/etc/fstab` is removed (a timestamped copy
+  of fstab is kept), and any fstab lines setup commented out are restored.
+- only the firewall rules setup added (IPFS ports and the LAN-only rules)
+- `/etc/ipfs-setup` (saved answers and NAS credentials)
+
+**Asked, and kept unless you say otherwise:**
+
+| Question | Default |
+| --- | --- |
+| Delete the IPFS repo (`/opt/ipfs/data`, every block and the node's identity key)? You must also type `delete`. | keep |
+| Uninstall Docker? Only asked if setup installed it; warns if other containers use it. | keep |
+| Turn ufw off? Only asked if setup turned it on. The SSH rule always stays. | keep on |
+
+**Never touched:** anything on the NAS (including the backup folder), and
+the `cifs-utils`, `rsync` and `ufw` packages.
+
+Running it again after a partial uninstall just skips what's already gone.
+It also works without saved answers, by finding setup's files, fstab block
+and firewall rule comments.

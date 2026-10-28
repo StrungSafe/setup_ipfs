@@ -31,6 +31,8 @@ CONF_DIR="/etc/ipfs-setup"
 CONF_FILE="$CONF_DIR/setup.conf"
 CRED_FILE="$CONF_DIR/smb-credentials"
 BACKUP_ENV_FILE="$CONF_DIR/backup.env"
+STATE_FILE="$CONF_DIR/state"   # what setup installed, read by --uninstall
+FSTAB="/etc/fstab"
 IPFS_DIR="/opt/ipfs"
 COMPOSE_FILE="$IPFS_DIR/docker-compose.yml"
 INIT_DIR="$IPFS_DIR/init.d"
@@ -73,6 +75,8 @@ NAS_E_CANT_TEST=16
 # ---------------------------------------------------------------- runtime --
 DRY_RUN=false
 IMPORT_ONLY=false
+UNINSTALL=false
+ASSUME_YES=false
 CONFIG_FILE=""
 INTERACTIVE=false
 FILE_CHANGED=false
@@ -543,6 +547,9 @@ Options:
                      read from the NAS_PASSWORD environment variable or the
                      saved credentials file)
   --import-backup    only import the NAS backup folder into MFS and pin it
+  --uninstall        remove what setup.sh added (asks before deleting the
+                     IPFS repo or Docker; never touches files on the NAS)
+  --yes              with --uninstall: no questions, keep the repo and Docker
   -h, --help         show this help
   --version          print the version
 EOF
@@ -557,6 +564,8 @@ parse_args() {
                 CONFIG_FILE=$2; shift ;;
             --config=*) CONFIG_FILE=${1#*=} ;;
             --import-backup) IMPORT_ONLY=true ;;
+            --uninstall) UNINSTALL=true ;;
+            --yes|-y) ASSUME_YES=true ;;
             -h|--help) usage; exit 0 ;;
             --version) echo "$SCRIPT_VERSION"; exit 0 ;;
             *) usage; die "unknown option: $1" ;;
@@ -578,6 +587,20 @@ load_conf() {
         info "loaded answers from $CONFIG_FILE"
     fi
     NAS_PASS="${NAS_PASSWORD:-}"
+}
+
+# Records that setup installed or turned on something (e.g. Docker), so
+# --uninstall only offers to remove what setup added. Never set back to false.
+mark_state() {
+    local others=""
+    if [[ -r "$STATE_FILE" ]]; then
+        others="$(grep -v "^$1=" "$STATE_FILE" || true)"
+    fi
+    printf '%s%s=true\n' "${others:+$others$'\n'}" "$1" | write_file "$STATE_FILE" 0644
+}
+
+state_is_set() {
+    [[ -r "$STATE_FILE" ]] && grep -qx "$1=true" "$STATE_FILE"
 }
 
 save_conf() {
@@ -1141,6 +1164,7 @@ install_docker() {
     run env DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
         docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     run systemctl enable --now docker
+    mark_state DOCKER_INSTALLED_BY_SETUP
     ok "Docker installed"
 }
 
@@ -1236,13 +1260,17 @@ write_fstab() {
         $0 == e { skip = 0; next }
         skip { next }
         $0 !~ /^[[:space:]]*#/ && $2 == mp { print "# disabled by ipfs-setup: " $0; next }
-        { print }' /etc/fstab)"
+        { print }' "$FSTAB")"
     new+=$'\n'"$FSTAB_BEGIN"$'\n'"$entry"$'\n'"$FSTAB_END"
+    save_fstab "$new"
+}
 
-    if [[ "$new" != "$(cat /etc/fstab)" ]] && ! $DRY_RUN; then
-        cp -p /etc/fstab "/etc/fstab.ipfs-setup.$(date +%Y%m%d%H%M%S).bak"
+# Writes a new fstab, keeping a timestamped copy of the old one if it changes.
+save_fstab() {
+    if [[ "$1" != "$(cat "$FSTAB")" ]] && ! $DRY_RUN; then
+        cp -p "$FSTAB" "$FSTAB.ipfs-setup.$(date +%Y%m%d%H%M%S).bak"
     fi
-    printf '%s\n' "$new" | write_file /etc/fstab 0644
+    printf '%s\n' "$1" | write_file "$FSTAB" 0644
 }
 
 # -------------------------------------------------------------- IPFS node --
@@ -1403,6 +1431,7 @@ configure_firewall() {
     run ufw allow from "$LAN_CIDR" to any port "$GATEWAY_PORT" proto tcp comment 'IPFS gateway (LAN only)'
     run ufw allow from "$LAN_CIDR" to any port 5353 proto udp comment 'mDNS (LAN discovery)'
     run ufw --force enable
+    $was_active || mark_state UFW_ENABLED_BY_SETUP
     ok "ufw: SSH ($ssh) and $SWARM_PORT open; $API_PORT and $GATEWAY_PORT limited to $LAN_CIDR"
 }
 
@@ -1759,6 +1788,242 @@ log "Backup completed successfully to $BACKUP_DIR in ${SECONDS}s (mirror deletes
 BACKUP_EOF
 }
 
+# -------------------------------------------------------------- uninstall --
+# Comments setup.sh gives its ufw rules; --uninstall removes only these.
+UFW_RULE_COMMENTS="IPFS swarm|IPFS swarm \(QUIC\)|IPFS API \(LAN only\)|IPFS gateway \(LAN only\)|mDNS \(LAN discovery\)"
+
+# Prints setup's ufw rules as "ufw delete" arguments, e.g. "allow 4001/tcp".
+# "ufw show added" lists rules even while ufw is inactive.
+ufw_setup_rules() {
+    have ufw || return 0
+    ufw show added 2>/dev/null \
+        | grep -E "^ufw .* comment '($UFW_RULE_COMMENTS)'\$" \
+        | sed -E "s/^ufw //; s/ comment '[^']*'\$//" || true
+}
+
+firewalld_setup_rules() {
+    firewall-cmd --permanent --list-rich-rules 2>/dev/null \
+        | grep -E "port port=\"?($API_PORT|$GATEWAY_PORT|5353)\"? protocol=\"?(tcp|udp)\"? accept" || true
+}
+
+fstab_mount_point() {
+    awk -v b="$FSTAB_BEGIN" -v e="$FSTAB_END" '
+        $0 == b { f = 1; next }
+        $0 == e { f = 0 }
+        f && $0 !~ /^#/ { print $2; exit }' "$FSTAB"
+}
+
+# Drops setup's block from fstab and restores entries setup commented out.
+remove_fstab_block() {
+    save_fstab "$(awk -v b="$FSTAB_BEGIN" -v e="$FSTAB_END" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        skip { next }
+        { sub(/^# disabled by ipfs-setup: /, ""); print }' "$FSTAB")"
+}
+
+# Like run, but ignores failures (e.g. stopping a unit that isn't loaded).
+quiet_run() {
+    if $DRY_RUN; then
+        run "$@"
+    else
+        "$@" >/dev/null 2>&1 || true
+    fi
+}
+
+uninstall() {
+    local nas_mount="${NAS_MOUNT:-}" image="" data_size="" others="" r unit m
+    local has_backup=false has_node=false has_fstab=false firewalld=false
+    local last_backup=false delete_data=false remove_docker=false disable_ufw=false
+    local go confirm cont
+    local rules=() rich=() found=() removing=() keeping=()
+
+    section "What setup.sh installed"
+    if [[ -f "$BACKUP_TIMER" || -f "$BACKUP_SERVICE" || -f "$BACKUP_SCRIPT" ]]; then
+        has_backup=true
+        found+=("backup timer, service and script")
+    fi
+    if have docker && docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+        if [[ "$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$CONTAINER_NAME" 2>/dev/null)" == "$COMPOSE_FILE" ]]; then
+            image="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME")"
+            found+=("IPFS container '$CONTAINER_NAME' ($image)")
+        else
+            warn "a container named '$CONTAINER_NAME' exists but wasn't created by setup.sh; it is left alone"
+        fi
+    fi
+    if [[ -f "$COMPOSE_FILE" || -d "$INIT_DIR" || -n "$image" ]]; then
+        has_node=true
+        found+=("node files in $IPFS_DIR")
+    fi
+    if grep -qxF "$FSTAB_BEGIN" "$FSTAB" 2>/dev/null; then
+        has_fstab=true
+        [[ -n "$nas_mount" ]] || nas_mount="$(fstab_mount_point)"
+        found+=("NAS mount at $nas_mount (marked block in $FSTAB)")
+    fi
+    mapfile -t rules < <(ufw_setup_rules)
+    ((${#rules[@]})) && found+=("${#rules[@]} ufw rules for IPFS")
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewalld=true
+        mapfile -t rich < <(firewalld_setup_rules)
+        found+=("firewalld port $SWARM_PORT and ${#rich[@]} LAN rules")
+    fi
+    [[ -d "$CONF_DIR" ]] && found+=("settings and NAS credentials in $CONF_DIR")
+    if [[ -d "$DATA_DIR" ]]; then
+        data_size="$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)"
+        found+=("IPFS repo $DATA_DIR (${data_size:-size unknown})")
+    fi
+
+    if ((${#found[@]} == 0)); then
+        ok "nothing from setup.sh was found on this machine"
+        return 0
+    fi
+    printf '  - %s\n' "${found[@]}" >&2
+
+    section "Choices"
+    if $has_backup && [[ -f "$BACKUP_SERVICE" ]] && container_running; then
+        ask_yn last_backup "Run one last backup to the NAS before removing anything?" true
+    fi
+    if [[ -d "$DATA_DIR" ]]; then
+        echo "The IPFS repo holds every block on this node and the node's identity key." >&2
+        ask_yn delete_data "Delete the IPFS repo at $DATA_DIR (${data_size:-size unknown})?" false
+        if $delete_data; then
+            ask confirm "Type 'delete' to confirm" ""
+            if [[ "$confirm" != "delete" ]]; then
+                info "keeping the repo"
+                delete_data=false
+            fi
+        fi
+    fi
+    if state_is_set DOCKER_INSTALLED_BY_SETUP && have docker; then
+        others="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -vx "$CONTAINER_NAME" || true)"
+        [[ -n "$others" ]] && warn "other containers use Docker on this machine: ${others//$'\n'/, }"
+        ask_yn remove_docker "Uninstall Docker too? (setup.sh installed it)" false
+    fi
+    if state_is_set UFW_ENABLED_BY_SETUP && have ufw; then
+        ask_yn disable_ufw "Turn ufw off? (setup.sh turned it on; the SSH rule stays either way)" false
+    fi
+
+    section "Summary"
+    $has_backup && removing+=("backup timer, service, script, logrotate config and log")
+    $has_node && removing+=("IPFS container${image:+, image $image}, compose file, init script, import folder")
+    $has_fstab && removing+=("NAS mount at $nas_mount and its $FSTAB block (a copy of $FSTAB is kept)")
+    ((${#rules[@]})) && removing+=("${#rules[@]} ufw rules for IPFS")
+    $firewalld && removing+=("firewalld port $SWARM_PORT and ${#rich[@]} LAN rules")
+    [[ -d "$CONF_DIR" ]] && removing+=("$CONF_DIR (saved answers, NAS credentials)")
+    if [[ -d "$DATA_DIR" ]]; then
+        if $delete_data; then removing+=("IPFS repo $DATA_DIR"); else keeping+=("IPFS repo $DATA_DIR"); fi
+    fi
+    if $remove_docker; then removing+=("Docker packages and Docker's apt source"); elif have docker; then keeping+=("Docker"); fi
+    if have ufw; then
+        if $disable_ufw; then removing+=("ufw turned off (rules other than IPFS's are kept)"); else keeping+=("ufw and its other rules, including SSH"); fi
+    fi
+    keeping+=("everything on the NAS, including the backup folder")
+    if ((${#removing[@]} == 0)); then
+        ok "nothing to remove; keeping:"
+        printf '  - %s\n' "${keeping[@]}" >&2
+        return 0
+    fi
+    echo "Will remove:" >&2
+    printf '  - %s\n' "${removing[@]}" >&2
+    echo "Will keep:" >&2
+    printf '  - %s\n' "${keeping[@]}" >&2
+    $DRY_RUN && warn "dry run: nothing will be changed"
+    ask_yn go "Uninstall now?" true
+    $go || die "aborted; nothing was changed"
+
+    if $last_backup; then
+        section "Last backup"
+        if run systemctl start ipfs-mfs-backup.service; then
+            $DRY_RUN || ok "last backup finished"
+        else
+            err "the last backup failed; see /var/log/ipfs_mfs_backup.log"
+            ask_yn cont "Continue uninstalling anyway?" false
+            $cont || die "stopped; nothing was removed"
+        fi
+    fi
+
+    section "Removing"
+    if $has_backup; then
+        quiet_run systemctl disable --now ipfs-mfs-backup.timer
+        quiet_run systemctl stop ipfs-mfs-backup.service
+        run rm -f "$BACKUP_TIMER" "$BACKUP_SERVICE" "$BACKUP_SCRIPT" "$BACKUP_ENV_FILE" "$LOGROTATE_FILE" \
+            /var/lock/ipfs_mfs_backup.lock /var/log/ipfs_mfs_backup.log*
+        run systemctl daemon-reload
+        ok "removed the scheduled backup"
+    fi
+
+    if $has_node; then
+        if [[ -f "$COMPOSE_FILE" ]] && have docker; then
+            run docker compose -p ipfs -f "$COMPOSE_FILE" down
+        elif [[ -n "$image" ]]; then
+            run docker rm -f "$CONTAINER_NAME"
+        fi
+        if [[ -n "$image" ]]; then
+            run docker image rm "$image" >/dev/null || warn "kept the image $image (still in use)"
+        fi
+        run rm -rf "$COMPOSE_FILE" "$INIT_DIR" "$IMPORT_DIR"
+        ok "removed the IPFS container and its files"
+    fi
+    if $delete_data; then
+        run rm -rf "$DATA_DIR"
+        ok "deleted the IPFS repo"
+    fi
+    [[ -d "$IPFS_DIR" ]] && run rmdir --ignore-fail-on-non-empty "$IPFS_DIR"
+
+    if $has_fstab; then
+        m="${nas_mount#/}"
+        unit="$(systemd-escape -p "$nas_mount" 2>/dev/null || echo "${m//\//-}")"
+        quiet_run systemctl stop "$unit.automount" "$unit.mount"
+        if findmnt -rn -t cifs,smb3 -M "$nas_mount" >/dev/null 2>&1; then
+            run umount "$nas_mount" || run umount -l "$nas_mount"
+        fi
+        remove_fstab_block
+        run systemctl daemon-reload
+        [[ -d "$nas_mount" ]] && run rmdir --ignore-fail-on-non-empty "$nas_mount"
+        ok "unmounted the NAS and removed it from $FSTAB"
+    fi
+
+    for r in "${rules[@]}"; do
+        local words=()
+        read -ra words <<<"$r"
+        run ufw --force delete "${words[@]}" >/dev/null || warn "could not delete the ufw rule: $r"
+    done
+    ((${#rules[@]})) && ok "removed ${#rules[@]} ufw rules"
+    if $disable_ufw; then
+        run ufw --force disable >/dev/null
+        ok "turned ufw off"
+    fi
+    if $firewalld; then
+        for r in "${rich[@]}"; do
+            run firewall-cmd --permanent --remove-rich-rule="$r" >/dev/null
+        done
+        run firewall-cmd --permanent --remove-port="$SWARM_PORT/tcp" --remove-port="$SWARM_PORT/udp" >/dev/null
+        run firewall-cmd --reload >/dev/null
+        ok "removed the firewalld rules"
+    fi
+
+    if $remove_docker; then
+        run env DEBIAN_FRONTEND=noninteractive apt-get purge -y -q \
+            docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        run rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.asc
+        ok "uninstalled Docker (images and volumes in /var/lib/docker are left in place)"
+    fi
+
+    [[ -d "$CONF_DIR" ]] && run rm -rf "$CONF_DIR"
+
+    section "Done"
+    if $DRY_RUN; then
+        ok "dry run finished; nothing was changed"
+        return 0
+    fi
+    ok "setup.sh's changes are removed"
+    echo "Kept:" >&2
+    printf '  - %s\n' "${keeping[@]}" >&2
+    if compgen -G "$FSTAB.ipfs-setup.*.bak" >/dev/null; then
+        echo "  - copies of $FSTAB from before each change: $FSTAB.ipfs-setup.*.bak" >&2
+    fi
+}
+
 # ----------------------------------------------------------------- report --
 final_report() {
     section "Done"
@@ -1791,11 +2056,26 @@ main() {
     parse_args "$@"
     trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
     trap cleanup_tmp EXIT
-    printf '%sIPFS node setup %s%s\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET" >&2
+    if $UNINSTALL; then
+        printf '%sIPFS node uninstall %s%s\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET" >&2
+    else
+        printf '%sIPFS node setup %s%s\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET" >&2
+    fi
 
     preflight
     setup_tty
     load_conf
+
+    if $UNINSTALL; then
+        if $ASSUME_YES; then
+            INTERACTIVE=false   # take the safe default for every question
+        elif ! $INTERACTIVE; then
+            die "no terminal for questions; add --yes to uninstall with the safe defaults"
+        fi
+        uninstall
+        return 0
+    fi
+    $ASSUME_YES && die "--yes only works with --uninstall"
 
     if $IMPORT_ONLY; then
         [[ -n "${NAS_MOUNT:-}" && -n "${BACKUP_SUBDIR:-}" ]] \
