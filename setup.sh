@@ -56,6 +56,7 @@ CONF_VARS=(
     NAS_SHARE NAS_MOUNT NAS_USER NAS_DOMAIN SMB_VERS
     KUBO_TAG RESTART_POLICY
     CORS_ORIGINS CORS_METHODS CID_VERSION IMPORT_CHUNKER ANNOUNCE_HOST
+    STORAGE_MAX LOW_POWER NODE_ROUTING NAS_SAVE_CONFIG
     LAN_CIDR
     BACKUP_SUBDIR MIRROR_DELETES BACKUP_NODE_CONFIG
     BACKUP_FREQUENCY BACKUP_TIME BACKUP_EVERY_HOURS BACKUP_DAYS BACKUP_MONTHDAY
@@ -86,8 +87,23 @@ LAN_IP=""
 DETECTED_CIDR=""
 NAS_PASS=""
 NAS_MOUNT_ERR=""
+NAS_CHECKED=false          # the NAS login check ran and passed
+FROM_NAS=false             # --from-nas
+SKIP_QUESTIONS=false       # using the settings saved on the NAS as-is
+NAS_SETTINGS_SOURCE=""     # e.g. "the NAS (saved 2026-10-28 ...)", for the summary
+RESTORE_IDENTITY="${RESTORE_IDENTITY:-false}"
+RESTORE_DIR=""             # local copy of <share>/node-config to restore from
+RESTORE_PEER_ID=""
 TMP_PATHS=()
+TMP_DIRS=()                # removed with their contents on exit
 IMPORT_SUMMARY="not run"
+declare -A NAS_SETTINGS=()
+NAS_SETTINGS_INFO=""
+
+# Settings file and node config backup on the NAS, relative to the share.
+NAS_SETTINGS_DIR="ipfs-setup"
+NAS_SETTINGS_REL="$NAS_SETTINGS_DIR/setup.conf"
+NODE_CONFIG_REL="node-config"
 
 # ---------------------------------------------------------------- output --
 if [[ -t 2 ]]; then
@@ -103,6 +119,10 @@ warn()    { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 err()     { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die()     { err "$*"; exit 1; }
 section() { printf '\n%s%s== %s ==%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET" >&2; }
+
+# Headings and explanations for questions; shown only when someone answers them.
+qsection() { if $INTERACTIVE; then section "$@"; fi; }
+note() { if $INTERACTIVE; then printf '%s\n' "$*" >&2; fi; }
 
 on_error() {
     local rc=$? line=$1 cmd=$2
@@ -130,6 +150,9 @@ cleanup_tmp() {
         else
             rm -f "$p"
         fi
+    done
+    for p in "${TMP_DIRS[@]}"; do
+        [[ "$p" == /tmp/ipfs-setup-* ]] && rm -rf -- "$p"
     done
 }
 
@@ -503,9 +526,9 @@ ask_chunker() {
         size-1048576) def=1mib ;;
         *) def=custom; custom="$IMPORT_CHUNKER" ;;
     esac
-    echo "Files up to the chunk size are stored as one block; bigger files are split into chunks." >&2
-    echo "It applies to content added without its own chunk size, including the backup import." >&2
-    echo "Content already on the node is not re-chunked." >&2
+    note "Files up to the chunk size are stored as one block; bigger files are split into chunks." >&2
+    note "It applies to content added without its own chunk size, including the backup import." >&2
+    note "Content already on the node is not re-chunked." >&2
     ask_menu choice "Chunk size for new files" "$def" \
         "default:256 KiB (Kubo's default)" \
         "1mib:1 MiB" \
@@ -526,6 +549,89 @@ ask_chunker() {
 # Always go through the daemon's API. Without --api, commands like "ipfs id"
 # also succeed offline while the daemon is still starting, and can then clash
 # with it over the repo lock.
+# ------------------------------------------------- storage, power, routing --
+# "50gb", "1.5 TB", "500MiB" -> Kubo's form ("50GB", "1.5TB", "500MiB"), or
+# "none". GB/TB are decimal and GiB/TiB binary, as in Kubo.
+parse_storage() {
+    local s="${1// /}" num unit
+    if [[ "${s,,}" == "none" ]]; then
+        printf 'none'
+        return 0
+    fi
+    [[ "${s,,}" =~ ^([0-9]{1,6}(\.[0-9]{1,3})?)(mb|gb|tb|mib|gib|tib)$ ]] || return 1
+    num="${BASH_REMATCH[1]}"
+    awk -v n="$num" 'BEGIN { exit !(n > 0) }' || return 1
+    case "${BASH_REMATCH[3]}" in
+        mb) unit=MB ;; gb) unit=GB ;; tb) unit=TB ;;
+        mib) unit=MiB ;; gib) unit=GiB ;; tib) unit=TiB ;;
+    esac
+    printf '%s%s' "$num" "$unit"
+}
+
+v_storage() {
+    parse_storage "$1" >/dev/null && return 0
+    warn "expected a size like 10GB, 500GB, 1.5TB or 200GiB, or 'none'"
+    return 1
+}
+
+# Free space where the repo will live, in decimal GB (Kubo's unit).
+free_gb() {
+    local dir="$IPFS_DIR"
+    while [[ ! -d "$dir" ]]; do dir="$(dirname "$dir")"; done
+    df -B1 --output=avail "$dir" 2>/dev/null | tail -n1 | awk '{ printf "%d", $1 / 1e9 }'
+}
+
+ask_storage() {
+    local free def=10GB
+    free="$(free_gb || true)"
+    # A node set up before this question existed keeps GC off unless asked:
+    # turning it on deletes cached content that was never pinned.
+    [[ -z "${STORAGE_MAX:-}" && -f "$DATA_DIR/config" ]] && def=none
+    note "With a limit, Kubo deletes cached content once the repo reaches 90% of it" \
+         "(checked hourly). Pinned content and anything in MFS is never deleted." >&2
+    note "Content that is neither pinned nor in MFS will be deleted, so make sure" \
+         "your apps pin what they add. 'none' turns this off." >&2
+    ask STORAGE_MAX "Limit IPFS storage to how much? (free space: ${free:-?} GB)" \
+        "${STORAGE_MAX:-$def}" v_storage
+    STORAGE_MAX="$(parse_storage "$STORAGE_MAX")"
+    if [[ "$STORAGE_MAX" =~ ^([0-9.]+)(GB|TB)$ && -n "$free" ]]; then
+        local gb="${BASH_REMATCH[1]}"
+        [[ "${BASH_REMATCH[2]}" == TB ]] && gb="$(awk -v n="$gb" 'BEGIN { print n * 1000 }')"
+        if awk -v a="$gb" -v b="$free" 'BEGIN { exit !(a > b) }'; then
+            warn "that is more than the $free GB free on this disk"
+        fi
+    fi
+}
+
+# Small devices: 4.5 GiB of RAM or less (covers "4 GB" boards), or an ARM CPU.
+small_device() {
+    local kb
+    kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null)"
+    [[ -n "$kb" && "$kb" -le 4718592 ]] && return 0
+    [[ "$(uname -m)" == arm* || "$(uname -m)" == aarch64 ]]
+}
+
+ask_low_power() {
+    local def=false
+    small_device && def=true
+    ask_yn LOW_POWER "Is this a small device like a Raspberry Pi? (lower connection and memory use)" \
+        "${LOW_POWER:-$def}"
+}
+
+ask_routing() {
+    ask_menu NODE_ROUTING "How should this node take part in the network?" "${NODE_ROUTING:-default}" \
+        "default:Kubo's default: also answer routing requests for others; announce every block" \
+        "home:Home node: use the network without serving it; announce only pinned and MFS content"
+}
+
+describe_storage() {
+    if [[ "$1" == none ]]; then
+        printf 'no limit (garbage collection off)'
+    else
+        printf '%s (garbage collection on)' "$1"
+    fi
+}
+
 ipfs_exec() { docker exec "$CONTAINER_NAME" ipfs "--api=/ip4/127.0.0.1/tcp/$API_PORT" "$@"; }
 
 container_running() {
@@ -547,9 +653,14 @@ Options:
                      read from the NAS_PASSWORD environment variable or the
                      saved credentials file)
   --import-backup    only import the NAS backup folder into MFS and pin it
+  --from-nas         set up from the settings saved on the NAS, without the
+                     questions; needs NAS_SHARE, NAS_USER and NAS_PASSWORD in
+                     the environment (optional: NAS_DOMAIN, SMB_VERS,
+                     NAS_MOUNT, RESTORE_IDENTITY=true)
   --uninstall        remove what setup.sh added (asks before deleting the
                      IPFS repo or Docker; never touches files on the NAS)
-  --yes              with --uninstall: no questions, keep the repo and Docker
+  --yes              with --from-nas: also skip the final confirmation;
+                     with --uninstall: no questions, keep the repo and Docker
   -h, --help         show this help
   --version          print the version
 EOF
@@ -565,6 +676,7 @@ parse_args() {
             --config=*) CONFIG_FILE=${1#*=} ;;
             --import-backup) IMPORT_ONLY=true ;;
             --uninstall) UNINSTALL=true ;;
+            --from-nas) FROM_NAS=true ;;
             --yes|-y) ASSUME_YES=true ;;
             -h|--help) usage; exit 0 ;;
             --version) echo "$SCRIPT_VERSION"; exit 0 ;;
@@ -664,17 +776,35 @@ latest_kubo_tag() {
 
 # ---------------------------------------------------------------- questions --
 collect_answers() {
-    local host default_origins public_ip use_public
-
     section "NAS share"
-    echo "The NAS holds the scheduled MFS backup (and any backup to import)." >&2
+    note "The NAS holds the scheduled MFS backup (and any backup to import)." >&2
+    # With --from-nas the NAS answers come from the environment.
+    local interactive=$INTERACTIVE
+    $FROM_NAS && INTERACTIVE=false
     ask_nas_share
     ask NAS_MOUNT "Mount point on this machine" "${NAS_MOUNT:-/mnt/ipfs}" v_abs_path
     ask_nas_login
     ask_smb_version
     validate_nas_login
+    INTERACTIVE=$interactive
 
-    section "IPFS node"
+    offer_nas_settings
+    offer_identity_restore
+
+    # Using the NAS settings as-is: every remaining question takes its saved
+    # value (each is still checked).
+    if $SKIP_QUESTIONS; then
+        info "using the settings saved on the NAS; skipping the remaining questions"
+        INTERACTIVE=false
+    fi
+    ask_node_settings
+    INTERACTIVE=$interactive
+}
+
+ask_node_settings() {
+    local host default_origins public_ip use_public
+
+    qsection "IPFS node"
     if [[ -z "${KUBO_TAG:-}" ]]; then
         KUBO_TAG="$(latest_kubo_tag || true)"
         KUBO_TAG="${KUBO_TAG:-latest}"
@@ -686,7 +816,7 @@ collect_answers() {
     host="$(hostname -s 2>/dev/null || hostname)"
     default_origins="http://$host.local:$API_PORT,http://localhost:$API_PORT,http://127.0.0.1:$API_PORT"
     [[ -n "$LAN_IP" ]] && default_origins+=",http://$LAN_IP:$API_PORT"
-    echo "Allowed origins are the web pages that may call the node's API" \
+    note "Allowed origins are the web pages that may call the node's API" \
          "(the WebUI, plus any web apps of your own, e.g. http://mydesktop.local:4173)." >&2
     ask CORS_ORIGINS "Allowed origins (comma-separated)" "${CORS_ORIGINS:-$default_origins}" v_origins
     CORS_ORIGINS="$(normalize_list "$CORS_ORIGINS")"
@@ -694,10 +824,13 @@ collect_answers() {
     CORS_METHODS="$(normalize_list "${CORS_METHODS^^}")"
     ask_choice CID_VERSION "CID version for new content" "${CID_VERSION:-1}" 1 0
     ask_chunker
+    ask_storage
+    ask_low_power
+    ask_routing
 
-    section "Reachability from outside your home network"
-    echo "Peers outside your network find you through your router's public address." >&2
-    echo "Enter your router's dynamic DNS name so it is announced to them." >&2
+    qsection "Reachability from outside your home network"
+    note "Peers outside your network find you through your router's public address." >&2
+    note "Enter your router's dynamic DNS name so it is announced to them." >&2
     ask ANNOUNCE_HOST "Router DNS name (blank to skip)" "${ANNOUNCE_HOST:-}" v_announce
     if [[ -z "$ANNOUNCE_HOST" ]] && $INTERACTIVE; then
         public_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
@@ -707,20 +840,24 @@ collect_answers() {
         fi
     fi
 
-    section "Firewall"
+    qsection "Firewall"
     ask LAN_CIDR "LAN subnet allowed to reach the API ($API_PORT) and gateway ($GATEWAY_PORT)" \
         "${LAN_CIDR:-${DETECTED_CIDR:-192.168.1.0/24}}" v_cidr
 
-    section "Backup"
+    qsection "Backup"
     ask BACKUP_SUBDIR "Backup folder inside the NAS share" "${BACKUP_SUBDIR:-backup}" v_subdir
     ask_schedule
     ask_yn MIRROR_DELETES "Delete files from the backup when they are deleted from MFS?" "${MIRROR_DELETES:-false}"
-    echo "The node's config holds its private identity key. Backing it up lets you" \
+    note "The node's config holds its private identity key. Backing it up lets you" \
          "restore the same peer ID, but puts the key on the NAS." >&2
     ask_yn BACKUP_NODE_CONFIG "Also back up the node config and keys?" "${BACKUP_NODE_CONFIG:-false}"
+    note "Saving these settings to the NAS lets another machine or a reinstall use them." \
+         "No passwords are saved, but anyone with access to the share can read the file." >&2
+    ask_yn NAS_SAVE_CONFIG "Save these settings to $NAS_SHARE/$NAS_SETTINGS_REL when setup finishes?" \
+        "${NAS_SAVE_CONFIG:-true}"
 
-    section "Importing an existing backup"
-    echo "If $NAS_MOUNT/$BACKUP_SUBDIR already has files, they can be imported into MFS and pinned." >&2
+    qsection "Importing an existing backup"
+    note "If $NAS_MOUNT/$BACKUP_SUBDIR already has files, they can be imported into MFS and pinned." >&2
     ask_yn IMPORT_HIDDEN "Include hidden files (dotfiles) when importing?" "${IMPORT_HIDDEN:-false}"
     if ! $IMPORT_HIDDEN && $MIRROR_DELETES; then
         warn "hidden files will not be imported, but mirrored deletions are on:"
@@ -868,6 +1005,35 @@ nas_login_check() {
     return "$rc"
 }
 
+# Copies <path> (relative to the share) into <dir> through a temporary
+# read-only mount. Returns 0 if copied, 1 if it isn't there, 2 on mount errors.
+#   nas_fetch <path> <dir>
+nas_fetch() {
+    local rel=$1 dest=$2 cred tmp rc=0
+    cred="$(mktemp)"
+    tmp="$(mktemp -d /tmp/ipfs-setup-mount.XXXXXX)"
+    TMP_PATHS+=("$cred" "$tmp")
+    chmod 600 "$cred"
+    credentials "$NAS_PASS" >"$cred"
+    # One retry: a mount right after another one occasionally fails.
+    local opts
+    opts="$(cifs_opts "$cred" "$SMB_VERS"),ro"
+    if mount -t cifs "$NAS_SHARE" "$tmp" -o "$opts" >/dev/null 2>&1 \
+        || { sleep 2; mount -t cifs "$NAS_SHARE" "$tmp" -o "$opts" >/dev/null 2>&1; }; then
+        if [[ -e "$tmp/$rel" ]]; then
+            cp -R "$tmp/$rel" "$dest/" || rc=2
+        else
+            rc=1
+        fi
+        umount "$tmp" 2>/dev/null || umount -l "$tmp" 2>/dev/null || true
+    else
+        rc=2
+    fi
+    rm -f "$cred"
+    rmdir "$tmp" 2>/dev/null || true
+    return "$rc"
+}
+
 # Finds the newest SMB 2.0+ version the NAS accepts, other than the one tried.
 find_smb_version() {
     local v rc
@@ -895,6 +1061,7 @@ validate_nas_login() {
         case "$rc" in
             0)
                 ok "logged in to $NAS_SHARE as $NAS_USER with SMB $SMB_VERS; the share is writable"
+                NAS_CHECKED=true
                 return 0 ;;
             "$NAS_E_CANT_TEST")
                 warn "this system doesn't allow a test mount here; skipping the NAS login check"
@@ -935,6 +1102,241 @@ validate_nas_login() {
         esac
         info "checking again"
     done
+}
+
+# ------------------------------------------------------- settings on the NAS --
+# Checks one saved setting with the same rules as a typed answer.
+# Returns 2 for a name setup.sh doesn't know.
+nas_setting_ok() {
+    local v=$2
+    case "$1" in
+        NAS_SHARE) v_share "$v" ;;
+        NAS_USER) v_nas_user "$v" ;;
+        NAS_DOMAIN) v_optional_word "$v" ;;
+        NAS_MOUNT) v_abs_path "$v" ;;
+        SMB_VERS) [[ "$v" =~ ^(3\.1\.1|3\.0|2\.1|2\.0|1\.0)$ ]] ;;
+        KUBO_TAG) v_docker_tag "$v" ;;
+        RESTART_POLICY) [[ "$v" =~ ^(unless-stopped|always|on-failure|no)$ ]] ;;
+        CORS_ORIGINS) v_origins "$v" ;;
+        CORS_METHODS) v_methods "$v" ;;
+        CID_VERSION) [[ "$v" == 0 || "$v" == 1 ]] ;;
+        IMPORT_CHUNKER) [[ -z "$v" ]] || v_chunker "$v" ;;
+        ANNOUNCE_HOST) v_announce "$v" ;;
+        STORAGE_MAX) v_storage "$v" ;;
+        LOW_POWER|MIRROR_DELETES|BACKUP_NODE_CONFIG|IMPORT_HIDDEN|NAS_SAVE_CONFIG)
+            [[ "$v" == true || "$v" == false ]] ;;
+        NODE_ROUTING) [[ "$v" == default || "$v" == home ]] ;;
+        LAN_CIDR) v_cidr "$v" ;;
+        BACKUP_SUBDIR) v_subdir "$v" ;;
+        BACKUP_FREQUENCY) [[ "$v" =~ ^(daily|hourly|weekly|monthly|custom)$ ]] ;;
+        BACKUP_TIME) [[ -z "$v" ]] || v_time "$v" ;;
+        BACKUP_EVERY_HOURS) [[ -z "$v" || "$v" =~ ^(1|2|3|4|6|8|12)$ ]] ;;
+        BACKUP_DAYS) [[ -z "$v" ]] || v_days "$v" ;;
+        BACKUP_MONTHDAY) [[ -z "$v" ]] || v_monthday "$v" ;;
+        BACKUP_SCHEDULE) v_calendar "$v" ;;
+        IMPORT_CONFLICT) [[ "$v" =~ ^(skip|replace|rename)$ ]] ;;
+        *) return 2 ;;
+    esac
+}
+
+# Reads a settings file from the NAS into NAS_SETTINGS without running it:
+# anyone who can write to the share could otherwise run commands as root.
+# Only KEY=value lines for known settings are taken, each checked like a
+# typed answer; everything else is reported and skipped.
+read_nas_settings() {
+    local file=$1 line key val inner n=0 rc
+    local q="'" esc="'\\''"   # a quote, and a quote as the writer escapes it
+    NAS_SETTINGS=()
+    NAS_SETTINGS_INFO=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        line="${line%$'\r'}"
+        if [[ "$line" =~ ^\#\ Saved:\ (.+)$ ]]; then
+            NAS_SETTINGS_INFO="${BASH_REMATCH[1]}"
+            continue
+        fi
+        [[ -z "${line//[[:space:]]/}" || "$line" == \#* ]] && continue
+        if [[ ! "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
+            warn "NAS settings line $n skipped: not KEY=value"
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        if [[ "$val" == "$q"*"$q" && ${#val} -ge 2 ]]; then
+            inner="${val:1:${#val}-2}"
+            if [[ "${inner//"$esc"/}" == *"$q"* ]]; then
+                warn "NAS settings line $n ($key) skipped: badly quoted value"
+                continue
+            fi
+            val="${inner//"$esc"/$q}"
+        elif [[ ! "$val" =~ ^[A-Za-z0-9._:/@,+*-]*$ ]]; then
+            warn "NAS settings line $n ($key) skipped: unquoted value with special characters"
+            continue
+        fi
+        rc=0
+        nas_setting_ok "$key" "$val" || rc=$?
+        case "$rc" in
+            0) NAS_SETTINGS[$key]="$val" ;;
+            2) warn "NAS settings line $n skipped: unknown setting $key" ;;
+            *) warn "NAS settings line $n ($key) skipped: invalid value" ;;
+        esac
+    done <"$file"
+}
+
+nas_settings_content() {
+    local v val q="'" esc="'\\''"
+    echo "# IPFS node settings saved by setup.sh $SCRIPT_VERSION."
+    echo "# Saved: $(date '+%Y-%m-%d %H:%M') from $(hostname -s 2>/dev/null || hostname)"
+    echo "# setup.sh reads this file (it never runs it). It holds no passwords."
+    for v in "${CONF_VARS[@]}"; do
+        val="${!v-}"
+        printf '%s=%s%s%s\n' "$v" "$q" "${val//"$q"/$esc}" "$q"
+    done
+}
+
+# Looks for settings saved on the NAS and offers to use them.
+offer_nas_settings() {
+    if [[ -n "$CONFIG_FILE" ]]; then
+        return 0
+    fi
+    if ! $NAS_CHECKED; then
+        $FROM_NAS && die "--from-nas needs to log in to the NAS, which wasn't possible here"
+        return 0
+    fi
+    local dir rc=0 choice k lan
+    dir="$(mktemp -d /tmp/ipfs-setup-nas.XXXXXX)"
+    TMP_DIRS+=("$dir")
+    nas_fetch "$NAS_SETTINGS_REL" "$dir" || rc=$?
+    if ((rc == 1)); then
+        $FROM_NAS && die "--from-nas: no saved settings at $NAS_SHARE/$NAS_SETTINGS_REL"
+        info "no saved settings on the NAS ($NAS_SHARE/$NAS_SETTINGS_REL)"
+        return 0
+    elif ((rc != 0)); then
+        $FROM_NAS && die "--from-nas: could not read $NAS_SHARE/$NAS_SETTINGS_REL"
+        warn "could not read the NAS to look for saved settings"
+        return 0
+    fi
+
+    read_nas_settings "$dir/setup.conf"
+    if ((${#NAS_SETTINGS[@]} == 0)); then
+        $FROM_NAS && die "--from-nas: $NAS_SHARE/$NAS_SETTINGS_REL has no usable settings"
+        warn "the settings file on the NAS has no usable settings; ignoring it"
+        return 0
+    fi
+
+    section "Settings saved on the NAS"
+    echo "Found $NAS_SHARE/$NAS_SETTINGS_REL${NAS_SETTINGS_INFO:+ (saved $NAS_SETTINGS_INFO)}:" >&2
+    for k in "${CONF_VARS[@]}"; do
+        if [[ -v "NAS_SETTINGS[$k]" ]]; then
+            printf '  %-20s %s\n' "$k" "${NAS_SETTINGS[$k]}" >&2
+        fi
+    done
+    if $FROM_NAS; then
+        choice=use
+    else
+        ask_menu choice "Use these settings?" use \
+            "use:Use them (skip the remaining questions; the summary still asks to confirm)" \
+            "defaults:Use them as defaults and go through the questions" \
+            "ignore:Ignore them"
+    fi
+    [[ "$choice" == ignore ]] && return 0
+
+    # The NAS connection just checked, and this machine's mount point, win
+    # over the saved ones.
+    for k in "${!NAS_SETTINGS[@]}"; do
+        case "$k" in
+            NAS_SHARE|NAS_USER|NAS_DOMAIN|SMB_VERS|NAS_MOUNT) ;;
+            *) printf -v "$k" '%s' "${NAS_SETTINGS[$k]}" ;;
+        esac
+    done
+    NAS_SETTINGS_SOURCE="the NAS${NAS_SETTINGS_INFO:+ (saved $NAS_SETTINGS_INFO)}"
+
+    if [[ -n "${NAS_SETTINGS[LAN_CIDR]:-}" && -n "$DETECTED_CIDR" \
+          && "${NAS_SETTINGS[LAN_CIDR]}" != "$DETECTED_CIDR" ]]; then
+        warn "the saved LAN subnet (${NAS_SETTINGS[LAN_CIDR]}) differs from this machine's ($DETECTED_CIDR)"
+        ask_menu lan "Which subnet may reach the API and gateway?" saved \
+            "saved:${NAS_SETTINGS[LAN_CIDR]} (saved on the NAS)" \
+            "detected:$DETECTED_CIDR (this machine's network)"
+        if [[ "$lan" == detected ]]; then LAN_CIDR="$DETECTED_CIDR"; fi
+    fi
+    if [[ "$choice" == use ]]; then SKIP_QUESTIONS=true; fi
+}
+
+# Offers to restore the node identity from <share>/node-config (written by
+# the "back up the node config and keys" option) on a machine with no repo.
+offer_identity_restore() {
+    $NAS_CHECKED || return 0
+    [[ -f "$DATA_DIR/config" ]] && return 0
+    local dir rc=0
+    dir="$(mktemp -d /tmp/ipfs-setup-identity.XXXXXX)"
+    chmod 700 "$dir"
+    TMP_DIRS+=("$dir")
+    nas_fetch "$NODE_CONFIG_REL" "$dir" || rc=$?
+    if ((rc != 0)) || [[ ! -f "$dir/$NODE_CONFIG_REL/config" ]]; then
+        RESTORE_IDENTITY=false
+        return 0
+    fi
+    RESTORE_PEER_ID="$(sed -n 's/.*"PeerID": *"\([^"]*\)".*/\1/p' "$dir/$NODE_CONFIG_REL/config" | head -n1)"
+
+    section "Node identity on the NAS"
+    echo "The NAS has a backup of a node's config and keys (peer ID ${RESTORE_PEER_ID:-unknown})." >&2
+    echo "Restoring it gives this machine the same peer ID. Don't run two machines with" \
+         "the same identity at the same time." >&2
+    ask_yn RESTORE_IDENTITY "Restore the node identity from the NAS?" "$RESTORE_IDENTITY"
+    if $RESTORE_IDENTITY; then
+        RESTORE_DIR="$dir/$NODE_CONFIG_REL"
+    fi
+}
+
+# Writes the settings to <share>/ipfs-setup/setup.conf (never the password),
+# keeping the previous file if it changed.
+save_nas_settings() {
+    $NAS_SAVE_CONFIG || return 0
+    section "Saving settings to the NAS"
+    local dir="$NAS_MOUNT/$NAS_SETTINGS_DIR" file new
+    file="$dir/setup.conf"
+    new="$(nas_settings_content)"
+    if $DRY_RUN; then
+        info "would write $NAS_SHARE/$NAS_SETTINGS_REL"
+        return 0
+    fi
+    if ! nas_mounted; then
+        warn "the NAS isn't mounted; settings were not saved"
+        return 0
+    fi
+    if [[ -f "$file" && "$(grep -v '^# Saved:' "$file")" == "$(grep -v '^# Saved:' <<<"$new")" ]]; then
+        ok "the settings on the NAS are already up to date"
+        return 0
+    fi
+    if { mkdir -p "$dir" \
+         && { [[ ! -f "$file" ]] || cp "$file" "$file.$(date +%Y%m%d%H%M%S).bak"; } \
+         && printf '%s\n' "$new" >"$file"; } 2>/dev/null; then
+        ok "saved to $NAS_SHARE/$NAS_SETTINGS_REL (no passwords)"
+    else
+        warn "could not write $NAS_SHARE/$NAS_SETTINGS_REL"
+    fi
+}
+
+# Creates the repo from the restored config (same peer ID) before the first start.
+restore_identity() {
+    $RESTORE_IDENTITY || return 0
+    [[ -n "$RESTORE_DIR" && -f "$RESTORE_DIR/config" ]] || return 0
+    if [[ -f "$DATA_DIR/config" ]]; then
+        warn "$DATA_DIR already has a repo; not restoring the identity over it"
+        return 0
+    fi
+    info "restoring the node identity (peer ID ${RESTORE_PEER_ID:-unknown}) from the NAS"
+    run docker run --rm --entrypoint ipfs -e IPFS_PATH=/data/ipfs \
+        -v "$DATA_DIR:/data/ipfs" -v "$RESTORE_DIR:/restore:ro" \
+        "ipfs/kubo:$KUBO_TAG" init /restore/config >/dev/null
+    if [[ -d "$RESTORE_DIR/keystore" ]]; then
+        run mkdir -p "$DATA_DIR/keystore"
+        run cp -R "$RESTORE_DIR/keystore/." "$DATA_DIR/keystore/"
+    fi
+    # The repo was written as root; the daemon runs as the image's ipfs user.
+    run docker run --rm --entrypoint chown -v "$DATA_DIR:/data/ipfs" \
+        "ipfs/kubo:$KUBO_TAG" -R ipfs:users /data/ipfs
+    $DRY_RUN || ok "restored peer ID ${RESTORE_PEER_ID:-unknown}"
 }
 
 # ---------------------------------------------------------- backup schedule --
@@ -1065,7 +1467,7 @@ ask_schedule() {
                 BACKUP_MONTHDAY="$((10#$BACKUP_MONTHDAY))"
                 ask_backup_time ;;
             custom)
-                echo "See 'man systemd.time' (CALENDAR EVENTS) for the syntax." >&2
+                note "See 'man systemd.time' (CALENDAR EVENTS) for the syntax." >&2
                 ask BACKUP_SCHEDULE "OnCalendar expression" "${BACKUP_SCHEDULE:-*-*-* 02:00:00}" v_calendar ;;
         esac
         BACKUP_SCHEDULE="$(build_schedule)"
@@ -1093,12 +1495,19 @@ show_summary() {
   Allowed methods ...... $CORS_METHODS
   CID version .......... $CID_VERSION
   Chunk size ........... $(describe_chunker "$IMPORT_CHUNKER")
+  Storage limit ........ $(describe_storage "$STORAGE_MAX")
+  Low-power mode ....... $LOW_POWER
+  Routing .............. $([[ "$NODE_ROUTING" == home ]] && echo "home node (announce pinned + MFS only)" || echo "Kubo's default")
   Announced addresses .. $announce
   Firewall ............. $SWARM_PORT/tcp+udp from anywhere; $API_PORT, $GATEWAY_PORT from $LAN_CIDR
   Backup ............... $NAS_MOUNT/$BACKUP_SUBDIR, $(describe_schedule), mirror deletes: $MIRROR_DELETES
   Node config backup ... $BACKUP_NODE_CONFIG
   Import ............... hidden files: $IMPORT_HIDDEN, on conflict: $IMPORT_CONFLICT
+  Settings ............. ${NAS_SETTINGS_SOURCE:+from $NAS_SETTINGS_SOURCE; }$(if $NAS_SAVE_CONFIG; then echo "saved to $NAS_SHARE/$NAS_SETTINGS_REL at the end"; else echo "not saved to the NAS"; fi)
 EOF
+    if $RESTORE_IDENTITY; then
+        echo "  Node identity ........ restore peer ID ${RESTORE_PEER_ID:-unknown} from the NAS" >&2
+    fi
     $DRY_RUN && warn "dry run: nothing will be changed"
     local go
     ask_yn go "Apply these settings?" true
@@ -1293,6 +1702,10 @@ services:
     image: ipfs/kubo:$KUBO_TAG
     container_name: $CONTAINER_NAME
     restart: $RESTART_POLICY
+$(if [[ "$STORAGE_MAX" != none ]]; then
+    echo "    # The image's default command, plus garbage collection."
+    echo '    command: ["daemon", "--migrate=true", "--agent-version-suffix=docker", "--enable-gc"]'
+fi)
     # Host networking: the firewall on this machine applies to every port, and
     # Kubo sees the real network (LAN discovery via mDNS, UPnP port mapping).
     network_mode: host
@@ -1338,6 +1751,30 @@ ipfs config --json Swarm.DisableNatPortMap false
 ipfs config --json Swarm.RelayClient.Enabled true
 ipfs config --json Swarm.EnableHolePunching true
 ipfs config --json Discovery.MDNS.Enabled true
+
+# Storage limit; garbage collection is turned on in the compose file.
+ipfs config Datastore.StorageMax $([[ "$STORAGE_MAX" == none ]] && echo 10GB || echo "$STORAGE_MAX")
+
+# Low-power mode: the connection and service limits of Kubo's lowpower profile.
+$(if $LOW_POWER; then
+    echo "ipfs config --json Swarm.ConnMgr '{\"Type\":\"basic\",\"LowWater\":20,\"HighWater\":40,\"GracePeriod\":\"1m0s\"}'"
+    echo "ipfs config --json Swarm.RelayService.Enabled false"
+    echo "ipfs config AutoNAT.ServiceMode disabled"
+else
+    echo "ipfs config --json Swarm.ConnMgr '{}'"
+    echo "ipfs config --json Swarm.RelayService '{}'"
+    echo "ipfs config --json AutoNAT '{}'"
+fi)
+
+# Routing: a home node uses the network without serving it, and announces
+# only pinned and MFS content.
+$(if [[ "$NODE_ROUTING" == home ]]; then
+    echo "ipfs config Routing.Type autoclient"
+    echo "ipfs config Provide.Strategy pinned+mfs"
+else
+    echo "ipfs config --json Routing.Type null"
+    echo "ipfs config --json Provide.Strategy null"
+fi)
 EOF
 }
 
@@ -1382,6 +1819,7 @@ deploy_node() {
 
     local compose=(docker compose -p ipfs -f "$COMPOSE_FILE")
     run "${compose[@]}" pull
+    restore_identity
     if $NODE_FILES_CHANGED; then
         run "${compose[@]}" up -d --force-recreate
     else
@@ -2064,7 +2502,18 @@ main() {
 
     preflight
     setup_tty
+
+    # With --from-nas, NAS details from the environment win over saved answers.
+    local v env_nas=()
+    if $FROM_NAS; then
+        for v in NAS_SHARE NAS_USER NAS_DOMAIN SMB_VERS NAS_MOUNT; do
+            [[ -n "${!v:-}" ]] && env_nas+=("$v=${!v}")
+        done
+    fi
     load_conf
+    for v in "${env_nas[@]}"; do
+        printf -v "${v%%=*}" '%s' "${v#*=}"
+    done
 
     if $UNINSTALL; then
         if $ASSUME_YES; then
@@ -2075,7 +2524,14 @@ main() {
         uninstall
         return 0
     fi
-    $ASSUME_YES && die "--yes only works with --uninstall"
+    if $FROM_NAS; then
+        [[ -z "$CONFIG_FILE" ]] || die "--from-nas and --config can't be used together"
+        [[ -n "${NAS_SHARE:-}" && -n "${NAS_USER:-}" ]] \
+            || die "--from-nas needs NAS_SHARE and NAS_USER (and NAS_PASSWORD) in the environment"
+        $ASSUME_YES && INTERACTIVE=false
+    elif $ASSUME_YES; then
+        die "--yes only works with --from-nas or --uninstall"
+    fi
 
     if $IMPORT_ONLY; then
         [[ -n "${NAS_MOUNT:-}" && -n "${BACKUP_SUBDIR:-}" ]] \
@@ -2087,8 +2543,8 @@ main() {
         return 0
     fi
 
-    $INTERACTIVE || [[ -n "$CONFIG_FILE" ]] \
-        || die "no terminal for questions; run interactively or pass --config <file>"
+    $INTERACTIVE || [[ -n "$CONFIG_FILE" ]] || $FROM_NAS \
+        || die "no terminal for questions; run interactively, or pass --config <file> or --from-nas --yes"
 
     collect_answers
     show_summary
@@ -2102,6 +2558,7 @@ main() {
     pause_backup_timer
     import_backup
     install_backup
+    save_nas_settings
     final_report
 }
 

@@ -48,6 +48,17 @@ curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh
    - your router's dynamic DNS name added to `Addresses.AppendAnnounce`, so
      peers outside your home network can find you, plus UPnP, relays and
      hole punching
+   - a storage limit (`Datastore.StorageMax`, default 10GB) with garbage
+     collection on. Once the repo nears the limit, Kubo deletes cached
+     content. Pinned content and anything in MFS is never deleted, so apps
+     should pin what they add. `none` turns this off. A node set up before
+     this option existed keeps it off unless you choose a limit.
+   - low-power mode for small devices (suggested on ARM or with 4 GB of RAM
+     or less): the connection limits of Kubo's `lowpower` profile, and no
+     relaying or AutoNAT service for other peers
+   - routing: Kubo's default, or "home node" (`Routing.Type=autoclient`,
+     `Provide.Strategy=pinned+mfs`), which uses the network without serving
+     it and announces only pinned and MFS content
 6. **Firewall** (ufw, or firewalld if it is already active):
    - SSH is allowed first, so you can't get locked out
    - `4001/tcp` and `4001/udp` (swarm) are open to everyone
@@ -70,6 +81,23 @@ curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh
    | Weekly | day(s) and time | `mon,thu` or `weekdays`, then `9:30pm` |
    | Monthly | day 1-28 and time | `1`, then `02:00` |
    | Custom | a systemd `OnCalendar` expression | `Sat *-*-* 03:15:00` |
+9. **Settings on the NAS** (optional, on by default): when setup finishes,
+   your answers are saved to `<share>/ipfs-setup/setup.conf`. The password
+   is never saved, but anyone with access to the share can read the file.
+   On the next setup, on this machine or another, setup finds the file
+   right after the NAS login check and offers to use it as-is, use it as
+   defaults, or ignore it.
+   - **Safety:** setup never runs the file. It only takes `KEY=value` lines
+     for known settings, and checks each value like a typed answer.
+   - **NAS connection:** the share, user and SMB version you just typed
+     always win over the ones in the file.
+   - **LAN subnet:** if the saved subnet differs from this machine's, setup
+     asks which to use.
+   - **Restoring the node identity:** this needs "back up the node config
+     and keys" to have been on. If the NAS has that backup and this machine
+     has no repo yet, setup offers to restore the identity, giving the same
+     peer ID. The default is no. Don't run two machines with the same
+     identity at the same time.
 
 ## What it asks
 
@@ -83,10 +111,14 @@ curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh
 | Allowed methods | `PUT,POST,GET` |
 | CID version | `1` |
 | Chunk size for new files | 256 KiB (Kubo's default); also 1 MiB or custom, e.g. `512KiB`, `1.5MiB` (KB/MB are binary units; max 2,096,896 bytes) |
+| Storage limit | `10GB` (garbage collection on); `none` for no limit. Sizes like `500GB`, `1.5TB`, `200GiB`. |
+| Small device (low-power mode)? | yes on ARM or with 4 GB of RAM or less |
+| Routing | Kubo's default; or home node |
 | Router DNS name to announce | none (you can use your current public IP instead) |
 | LAN subnet for API/gateway | detected |
 | Backup folder, schedule, mirror deletions | `backup`, daily at 02:00, no |
 | Back up the node config and keys | no |
+| Save these settings to the NAS | yes |
 | Include hidden files when importing | no |
 | If an imported item already exists in MFS | skip |
 
@@ -112,7 +144,16 @@ sudo bash setup.sh --import-backup
 
 # Run without questions, using an answers file
 sudo NAS_PASSWORD='...' bash setup.sh --config setup.conf
+
+# Set up (or reinstall) from the settings saved on the NAS; only the final
+# confirmation is asked, and --yes skips that too
+curl -fsSL https://raw.githubusercontent.com/StrungSafe/setup_ipfs/main/setup.sh \
+  | sudo NAS_SHARE=//nas.example.lan/ipfs NAS_USER=me NAS_PASSWORD='...' bash -s -- --from-nas
 ```
+
+With `--from-nas`, you can also set `NAS_DOMAIN`, `SMB_VERS` and
+`NAS_MOUNT` in the environment, and `RESTORE_IDENTITY=true` to restore
+the node identity from the NAS.
 
 See [examples/setup.conf.example](examples/setup.conf.example) for every
 setting.
@@ -130,6 +171,7 @@ setting.
 | `/usr/local/sbin/ipfs_mfs_backup.sh` | backup script |
 | `/etc/systemd/system/ipfs-mfs-backup.{service,timer}` | backup schedule |
 | `/etc/logrotate.d/ipfs_mfs_backup` | log rotation |
+| `<share>/ipfs-setup/setup.conf` (on the NAS) | saved settings for the next setup, no password; earlier versions kept as `.bak`. The uninstall leaves it alone, like everything on the NAS. |
 
 Useful commands:
 

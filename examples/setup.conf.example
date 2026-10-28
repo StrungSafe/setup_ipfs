@@ -28,6 +28,15 @@ CID_VERSION=1
 # block). Blank = Kubo's default (256 KiB). A size like 1MiB or 512KiB, or a
 # Kubo chunker string (size-1048576, rabin-..., buzhash). Max 2,096,896 bytes.
 IMPORT_CHUNKER=
+# Storage limit, e.g. 10GB (default), 500GB, 1.5TB, 200GiB. Garbage collection
+# then deletes cached content once the repo nears it; pinned and MFS content
+# is never deleted. 'none' = no limit, garbage collection off.
+STORAGE_MAX=10GB
+# Small device (Raspberry Pi etc.): Kubo's lowpower connection limits.
+LOW_POWER=false
+# default = Kubo's routing; home = use the network without serving it, and
+# announce only pinned and MFS content
+NODE_ROUTING=default
 
 # Router dynamic DNS name announced to peers outside your network (blank to skip)
 ANNOUNCE_HOST=myhome.ddns.example
@@ -51,6 +60,9 @@ BACKUP_MONTHDAY=1
 # For the other frequencies this is generated from the settings above.
 BACKUP_SCHEDULE='*-*-* 02:00:00'
 MIRROR_DELETES=false
+# Save these settings (never the password) to <share>/ipfs-setup/setup.conf
+# when setup finishes, for another machine or a reinstall.
+NAS_SAVE_CONFIG=true
 BACKUP_NODE_CONFIG=false
 
 # Import of an existing backup folder
